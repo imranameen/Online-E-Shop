@@ -1,0 +1,5618 @@
+define('responsive',['has', 'nbd/util/media'], function(has, media) {
+  'use strict';
+
+  var setup;
+
+  function init() {
+    if (setup) { return; }
+
+    // Will immediately check and fire events according to their media queries
+    try {
+      media({
+        'desktop': 'all',
+      });
+    }
+    catch (noMediaQuery) {
+      // Fallback to desktop if media query is impossible
+      var breakpoint = window.innerWidth < 604 ? 'phone' :
+        window.innerWidth < 1025 ? 'tablet' :
+        'desktop';
+      media.is = function(bp) {
+        return bp === breakpoint;
+      };
+      media.getState = function(bp) {
+        if (bp) { return media.is(bp); }
+        return [breakpoint];
+      };
+      media.trigger(breakpoint + ' ' + breakpoint +':enter', true);
+    }
+
+    // Scroll to hide location bar
+    if ( has('touch') ) {
+      window.scrollTo(0,1);
+    }
+
+    setup = true;
+  }
+
+  function destroy() {}
+
+  return {
+    init : init,
+    destroy : destroy
+  };
+});
+
+define('be/View/Follow',['jquery',
+       'nbd/View'
+], function($, View) {
+  'use strict';
+
+  var constructor = View.extend({
+    init : function($view, model) {
+      this.$view = $view;
+      this._model = model;
+      this.rendered();
+    },
+
+    destroy : function() {
+      this._model.off(null, null, this);
+    },
+
+    rendered : function() {
+      var self = this;
+
+      this._model.on('following', function(following) {
+        this.$view.toggleClass('following', following);
+
+        if (following) {
+          this.$view.addClass('following-hold')
+          .one('mouseleave', function() {
+            $(this).removeClass('following-hold');
+          });
+        }
+      }, this);
+
+      this.$view.on('click', function() {
+        var data = $(this).data(),
+            postParams = {
+              backfill : data.backfill
+            };
+
+        self._controller.follow(postParams);
+      });
+    },
+
+    updateCount : function (delta) {
+      var $count = this.$view.parent().find('.gallery-stats-followers-count'),
+          count = (+$count.html()) + delta;
+
+      $count.html(count > 0 ? count : 0);
+    }
+  });
+
+  return constructor;
+});
+
+/*
+ * Google Analytics tracking
+ * IMPORTANT: This module is untestable locally without commenting out 
+ * _setDomainName from google script
+ */
+/*global _gaq */
+define('lib/gaq',{
+  page : function(url) {
+    try {
+      if ( _gaq !== undefined ) {
+        _gaq.push(['_trackPageview', url || location.href]);
+      }
+    } catch (gaqError) {}
+  },
+
+  event : function(category, action, label, value, noninteract) {
+    try {
+      if ( typeof _gaq !== 'undefined' ) {
+        var arr = Array.prototype.slice.call(arguments);
+        arr.unshift('_trackEvent');
+        _gaq.push(arr);
+      }
+    } catch (gaqError) {}
+  },
+
+  customVar : function(index, name, value, scope) {
+    if (!(index && name && value !== undefined)) { return; }
+    try {
+      if ( typeof _gaq !== 'undefined' ) {
+        var arr = Array.prototype.slice.call(arguments);
+        arr.unshift('_setCustomVar');
+        _gaq.push(arr);
+      }
+    } catch (gaqError) {}
+  }
+});
+
+define('lib/xhr',['jquery', 'nbd/trait/promise'], function($, Promise) {
+  'use strict';
+
+  /**
+  * Returns a promise wrapping jQuery.ajax()
+  * This is so we can get proper error reporting
+  */
+  return function() {
+    var thenable,
+        p = new Promise(),
+        req = $.ajax.apply($, arguments);
+
+    p.resolve(req);
+
+    thenable = p.thenable();
+    thenable.abort = req.abort;
+    return thenable;
+  };
+
+});
+
+define('be/Controller/Follow',[
+  'jquery',
+  'nbd/Controller',
+  'nbd/Model',
+  'be/View/Follow',
+  'lib/gaq',
+  'lib/xhr'
+], function($, Controller, Model, View, gaq, xhr) {
+  'use strict';
+
+  var constructor = Controller.extend({
+    init : function(id, following, type) {
+      this.views = [];
+      this.type = type || 'user';
+
+      this._model = new Model(id, {
+        blocking : false,
+        following : following || false
+      });
+    },
+
+    _initView : function($view) {
+      var view = new View($view, this._model);
+      view._controller = this;
+      return view;
+    },
+
+    add : function($view) {
+      if ($view.data('befollow')) { return this; }
+      var button = this._initView($view);
+      $view.data('befollow', button);
+      this.views.push(button);
+      return this;
+    },
+
+    update : function (following) {
+      var count = following ? 1 : -1;
+
+      this.views.forEach(function (view) {
+        view.updateCount(count);
+      });
+    },
+
+    follow : function(postParams) {
+      if (this._model.get('blocking')) { return; }
+
+      var model = this._model,
+          following = this._model.get('following'),
+          key = this.constructor.DATA_KEY[this.type],
+          url = this.constructor.url( this.type, this._model.id() ),
+          type = following ? 'DELETE' : 'POST';
+
+      function unblock() {
+        model.set('blocking', false);
+      }
+
+      this._model.set('blocking', true);
+
+      return xhr({
+        url     : url,
+        type    : type,
+        data    : postParams
+      })
+      .then(function(response) {
+
+        if (!response || !response.valid) { return; }
+
+        model.set('following', !following);
+        gaq.event('follow', window.location.pathname, window.location.search);
+
+      })
+      .then( unblock, unblock );
+    },
+
+    destroy : function() {
+      this.views.forEach(function(view) {
+        view.destroy();
+      });
+      this.views = [];
+
+      this._model.destroy();
+      this._model = null;
+    }
+  }, {
+    RELATIONS_URL : '/relations',
+    DATA_KEY : {
+      user : 'followee',
+      collection : 'list_id',
+      site : 'site_id'
+    },
+    url : function( type, id ){
+      return this.RELATIONS_URL + '/' + type + '/' + id;
+    }
+  });
+
+  return constructor;
+});
+
+define('be/follow',['jquery',
+       'nbd/util/extend',
+       'nbd/trait/pubsub',
+       'be/Controller/Follow'
+], function($, extend, pubsub, Follow) {
+  'use strict';
+
+  var cache = {
+    users : {},
+    collections : {},
+    sites : {}
+  },
+
+  create = function(type, id, following) {
+    var rel = new Follow(id, following, type);
+    this.listenTo(rel._model, 'following', function(following) {
+      this.trigger('following', id, following);
+    });
+    return rel;
+  },
+
+  // Bind buttons for following different types
+  follow = function($this, data_key, type, cache_key) {
+    var followee = $this.data(data_key) || +$this.attr(data_key);
+
+      // Missing data
+      if (!followee) { return; }
+
+      // Don't allow double creations
+      cache[cache_key][followee] =
+        (cache[cache_key ][followee] ||
+         create.call(api, type, followee, $this.hasClass('following')))
+        .add($this);
+  },
+
+  api = {
+    init : function($context) {
+      this.users($context);
+      this.collections($context);
+      this.sites($context);
+    },
+
+    // Looks for buttons to bind clicks for users
+    users : function($context) {
+      var self = this;
+
+      $('.action-follow-user', $context).each(function() {
+        self.followUser($(this));
+      });
+    },
+
+    // Looks for buttons to bind clicks for collections
+    collections : function($context) {
+      var self = this;
+
+      $('.action-follow-collection', $context).each(function() {
+        self.followCollection($(this));
+      });
+    },
+
+    // Looks for buttons to bind clicks for sites
+    sites : function($context) {
+      var self = this;
+
+      $('.action-follow-site', $context).each(function() {
+        self.followSite($(this));
+      });
+    },
+
+    // Bind specific button to follow user
+    followUser : function($this) {
+      follow($this, 'followee', 'user', 'users');
+    },
+
+    // Bind specific button to follow collection
+    followCollection : function($this) {
+      follow($this, 'list_id', 'collection', 'collections');
+    },
+
+    // Bind specific button to follow served sites / CCNs
+    followSite : function($this) {
+      follow($this, 'site_id', 'site', 'sites');
+    },
+
+    getUser : function(id) {
+      return cache.users[id];
+    },
+
+    getCollection : function(id) {
+      return cache.collections[id];
+    },
+
+    getSite : function(id) {
+      return cache.sites[id];
+    },
+
+    usersFollowed : function() {
+      return Object.keys(cache.users).filter(function(id) {
+        return cache.users[id]._model.get('following');
+      }).length;
+    }
+  };
+
+  extend(api, pubsub);
+
+  return api;
+
+});
+
+// Initialize 3rd party social sharing widgets
+/*global FB, twttr, IN, STMBLPN */
+define('lib/social',['jquery'], function($) {
+  'use strict';
+
+  var api = {
+    init: function($context) {
+      this.twitter($context);
+      this.facebook($context);
+      this.linkedin($context);
+      this.pinterest($context);
+      this.stumbledupon($context);
+    },
+
+    twitter: function($context) {
+      if ($('.viral-button-twitter', $context).length) {
+        require(['//platform.twitter.com/widgets.js'], function() {
+          try {
+            twttr.widgets.load();
+          }
+          catch (e) {}
+        });
+      }
+    },
+
+    linkedin: function($context) {
+      if ($('.viral-button-linkedin', $context).length) {
+        require(['//platform.linkedin.com/in.js'], function() {
+          if (typeof IN !== 'undefined' && IN.parse) { IN.parse(); }
+        });
+      }
+    },
+
+    facebook: function($context) {
+      if ($('.fb-like', $context).length) {
+        require(['//connect.facebook.net/en_US/all.js#xfbml=1'], function() {
+          if (typeof FB !== 'undefined' && FB.XFBML) { FB.XFBML.parse(); }
+        });
+      }
+    },
+
+    pinterest: function pinterest($context) {
+      $('.viral-button-pinterest', $context).on('click', function() {
+        require(['//assets.pinterest.com/js/pinmarklet.js'], function() {
+          if (typeof pinterest === 'undefined') {
+            return;
+          }
+
+          if (pinterest.PIN) {
+            pinterest.PIN.f.init();
+            return;
+          }
+
+          pinterest.PIN = Object.keys(window).filter(function(key) {
+            return (/^PIN_/).test(key);
+          })[0];
+        });
+      });
+    },
+
+    stumbledupon: function($context) {
+      if ($('.viral-button-stumble', $context).length && window.location.protocol === 'https:') {
+        require(['//platform.stumbleupon.com/1/widgets.js'], function() {
+          if (typeof STMBLPN !== 'undefined') { STMBLPN.processWidgets(); }
+        });
+      }
+    }
+  };
+
+  return api;
+});
+
+define('be/Controller/Dialog',[
+  'nbd/Controller/Entity',
+  'nbd/util/media'
+], function(Entity, media) {
+  'use strict';
+
+  var constructor = Entity.extend({
+    init : function() {
+      this._super.apply(this, arguments);
+      this.mediaView = this.mediaView.bind(this);
+      media.on('all', this.mediaView);
+    },
+
+    destroy : function() {
+      media.off(null, this.mediaView);
+      if (this._view) {
+        this._view.destroy();
+      }
+      this._model.destroy();
+    },
+
+    _initView : function(CLASSES, model) {
+      var ViewClass,
+      breakpoints = media.getState();
+
+      if (typeof CLASSES === 'function') {
+        ViewClass = CLASSES;
+      }
+      else {
+        ViewClass = breakpoints.map(function(breakpoint) {
+          return CLASSES[breakpoint];
+        })
+        .filter(function(ViewClass) {
+          return !!ViewClass;
+        })[0];
+      }
+
+      if (typeof ViewClass !== 'function') { return; }
+
+      this.View = this._view = new ViewClass(model);
+      this._view.Controller = this._view._controller = this;
+    },
+
+    render : function() {
+      return this._view && this._view.render.apply(this._view, arguments);
+    },
+
+    mediaView : function(breakpoint, active) {
+      var ViewClass = this.constructor.VIEW_CLASS[breakpoint];
+      if (ViewClass && active) {
+        this.requestView(ViewClass);
+      }
+    },
+
+    switchView : function(ViewClass) {
+      var existing = this._view;
+      this._initView(ViewClass, this._model);
+
+      return existing && existing.destroy();
+    }
+  });
+
+  return constructor;
+});
+
+define('be/Controller/Dialog/Roulette',['jquery',
+       'be/Controller/Dialog',
+       'nbd/util/async',
+       'nbd/Model'
+], function($, Controller, async, ModelClass) {
+  'use strict';
+
+  var constructor = Controller.extend({
+
+    $context : null,
+
+    setContext : function( $context ) {
+      if (this.$context) {
+        this.$context.off('click');
+      }
+
+      this.$context = $context
+      .on('click', function(e) {
+        if (e.isDefaultPrevented() ||
+            e.originalEvent.data === this._view ) { return; }
+        this.toggle(e.delegateTarget);
+      }.bind(this) );
+    },
+
+    render : function($context) {
+      var retval = this._view.render(document.body);
+      this._view.position($context);
+      return retval;
+    },
+
+    toggle : function($context) {
+      if (!( this._view.$view && this._view.$view.length )) {
+        this.render($context || this.$context);
+        async( this._view.show.bind(this._view) );
+      }
+      else {
+        this._view.toggle();
+        this._view.position($context);
+      }
+    }
+
+  }, {
+    MODEL_CLASS : ModelClass
+  });
+
+  return constructor;
+});
+
+
+define("require/hgn!templates/dialog", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div class=\"popup ");t.b(t.v(t.f("dialogType",c,p,0)));if(t.s(t.f("classes",c,p,1),c,p,0,44,50,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" ");t.b(t.v(t.d(".",c,p,0)));});c.pop();}if(!t.s(t.f("buttons",c,p,1),c,p,1,0,0,"")){t.b(" no-buttons");};if(!t.s(t.f("title",c,p,1),c,p,1,0,0,"")){t.b(" no-title");};if(t.s(t.f("fullBleed",c,p,1),c,p,0,140,151,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" full-bleed");});c.pop();}t.b("\">");t.b("\n" + i);t.b("  <div class=\"popup-inner-wrap\">");t.b("\n");t.b("\n" + i);if(t.s(t.f("toolbar",c,p,1),c,p,0,218,622,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("    <div class=\"toolbar\">");t.b("\n" + i);t.b("      ");if(t.s(t.f("title",c,p,1),c,p,0,261,302,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("<h1 class=\"popup-header\">");t.b(t.t(t.f("title",c,p,0)));t.b("</h1>");});c.pop();}t.b("\n" + i);if(!t.s(t.f("hideClose",c,p,1),c,p,1,0,0,"")){t.b("        <a class=\"header-action close right js-close");if(!t.s(t.f("layover",c,p,1),c,p,1,0,0,"")){t.b(" popup-close");};t.b("\">");t.b("\n" + i);t.b("          <span class=\"popup-icon-close beicons beicons-x\"></span>");t.b("\n" + i);t.b("        </a>");t.b("\n" + i);};if(t.s(t.f("layover",c,p,1),c,p,0,544,594,"{{ }}")){t.rs(c,p,function(c,p,t){if(t.s(t.f("button",c,p,1),c,p,0,564,576,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(t.rp("<button0",c,p,""));});c.pop();}});c.pop();}t.b("    </div>");t.b("\n" + i);});c.pop();}t.b("\n" + i);t.b("    <div class=\"popup-content");if(t.s(t.f("toolbar",c,p,1),c,p,0,677,689,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" has-toolbar");});c.pop();}t.b("\">");t.b("\n" + i);t.b(t.rp("<content1",c,p,"      "));if(!t.s(t.f("layover",c,p,1),c,p,1,0,0,"")){t.b("    </div>");t.b("\n" + i);};t.b("\n" + i);t.b("      <div class=\"popup-buttons");if(!t.s(t.f("buttons",c,p,1),c,p,1,0,0,"")){t.b(" hide");};t.b(" cfix\">");t.b("\n" + i);if(t.s(t.f("buttons",c,p,1),c,p,0,858,870,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(t.rp("<button2",c,p,""));});c.pop();}t.b("      </div>");t.b("\n");t.b("\n" + i);if(t.s(t.f("layover",c,p,1),c,p,0,913,929,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("    </div>");t.b("\n" + i);});c.pop();}t.b("\n" + i);t.b("  </div> <!-- /.popup-inner -->");t.b("\n");t.b("\n" + i);t.b("</div>");t.b("\n");t.b("\n" + i);if(t.s(t.f("blocking",c,p,1),c,p,0,997,1031,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("<div class=\"blocking-div\"></div>");t.b("\n" + i);});c.pop();}return t.fl(); },partials: {"<button0":{name:"button", partials: {}, subs: {  }},"<content1":{name:"content", partials: {}, subs: {  }},"<button2":{name:"button", partials: {}, subs: {  }}}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+
+define("require/hgn!templates/button", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("  <div class=\"form-item form-item-a");if(t.s(t.f("containerClasses",c,p,1),c,p,0,56,62,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" ");t.b(t.v(t.d(".",c,p,0)));});c.pop();}t.b("\">");t.b("\n" + i);t.b("    <a class=\"form-button");if(t.s(t.f("classes",c,p,1),c,p,0,123,129,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" ");t.b(t.v(t.d(".",c,p,0)));});c.pop();}if(!t.s(t.f("classes",c,p,1),c,p,1,0,0,"")){t.b(" form-button-default");};t.b("\"");t.b("\n" + i);t.b("      ");if(t.s(t.f("href",c,p,1),c,p,0,202,218,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" href=\"");t.b(t.v(t.f("href",c,p,0)));t.b("\"");});c.pop();}t.b(" unselectable=\"on\"");t.b("\n" + i);t.b("      tabindex=\"");t.b(t.v(t.f("tabindex",c,p,0)));if(!t.s(t.f("tabindex",c,p,1),c,p,1,0,0,"")){t.b("0");};t.b("\">");t.b(t.v(t.f("label",c,p,0)));t.b("</a>");t.b("\n" + i);t.b("  </div>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('be/View/Dialog',[
+  'jquery',
+  'nbd/View/Entity',
+  'nbd/util/extend',
+  'hgn!templates/dialog',
+  'hgn!templates/button'
+], function($, View, extend, dialog, button) {
+  'use strict';
+
+  var constructor = View.extend({
+    mustache : {},
+
+    template : function(data) {
+      return $(dialog(data, extend({
+        content : this.mustache.template,
+        button  : button.template
+      }, this.partials)));
+    },
+
+    rendered : function() {
+      this.$view
+      .on('click', '.js-close, .close, .form-button-close, .form-button-cancel',
+          this.hide.bind(this))
+      .find('.form-button-disabled').on('click', false);
+    },
+
+    position : function() {},
+
+    show : function() {
+      return this.trigger('show', this.$view);
+    },
+
+    hide : function() {
+      return this.trigger('hide', this.$view);
+    }
+  });
+
+  return constructor;
+});
+
+define('be/View/Dialog/Layover',[
+  'jquery',
+  'be/View/Dialog'
+], function($, View) {
+  'use strict';
+
+  var constructor = View.extend({
+    destroy : function() {
+      this.hide();
+      this._super();
+    },
+
+    template : function(data) {
+      return this._super($.extend({
+        dialogType : "layover",
+        layover    : true,
+        toolbar    : true
+      }, data));
+    },
+
+    rendered : function() {
+      this._super();
+      this.show();
+    },
+
+    show : function() {
+      if (!this.$view) { return; }
+      this.scrollTop = this.scrollTop || $(window).scrollTop();
+      $('#site-content').hide();
+      $('html').addClass('overflow-hidden');
+      this.$view.show();
+      return this._super();
+    },
+
+    hide : function() {
+      if (!this.$view) { return; }
+      $('#site-content').show();
+      $('html').removeClass('overflow-hidden');
+      window.scrollTo(0, this.scrollTop);
+      delete this.scrollTop;
+      this.$view.hide();
+      return this._super();
+    }
+  });
+
+  return constructor;
+});
+
+define('be/View/Menu',[
+  'jquery',
+  'be/View/Dialog',
+  'nbd/util/async',
+  'jquery/ui/position'
+], function($, View, async) {
+  'use strict';
+
+  var constructor = View.extend({
+
+    init : function() {
+      this._super.apply(this, arguments);
+      this.dismiss = function(e) {
+        if (e.originalEvent.data !== this) {
+          this.hide();
+          e.preventDefault();
+        }
+      }.bind(this);
+    },
+
+    destroy : function() {
+      this._unbind();
+      this._super();
+    },
+
+    template : function(data) {
+      return this._super($.extend({
+        dialogType   : "menu",
+        blocking     : false,
+        hide_toolbar : true
+      }, data));
+    },
+
+    rendered : function() {
+      this._super();
+      var self = this;
+
+      // "annotate" the event
+      this.$view.on('click touchend', function(e) {
+        e.originalEvent.data = self;
+      });
+    },
+
+    _bind : function() {
+      $('html').on('click touchend', this.dismiss);
+    },
+
+    _unbind : function() {
+      $('html').off('click touchend', this.dismiss);
+    },
+
+    position : function($context, positioning) {
+      if (!this.$view) { return; }
+
+      if ( $context ) {
+        this._lastContext = $context;
+      }
+
+      var defaultPosition = {
+        my : "left top",
+        at : "left bottom+10",
+        of : this._lastContext,
+        collision : "flipfit"
+      };
+
+      this.$view.position($.extend(defaultPosition, positioning));
+    },
+
+    show : function() {
+      if (!this.$view) { return; }
+
+      async(this._bind.bind(this));
+      this.$view.addClass('shown');
+      return this._super();
+    },
+
+    hide : function() {
+      if (!this.$view) { return; }
+
+      this._unbind();
+      this.$view.removeClass('shown');
+      return this._super();
+    },
+
+    toggle : function() {
+      return this[this.$view.hasClass('shown') ? 'hide' : 'show']();
+    }
+  });
+
+  return constructor;
+});
+
+define('lib/keyboard',['jquery', 'nbd/Class'], function($, Class) {
+  'use strict';
+
+  var keyhandler = new (Class.extend({
+
+    listeners : null,
+    globals   : null,
+
+    ignoredElements : {
+      "INPUT" : true,
+      "TEXTAREA" : true
+    },
+
+    init : function( options ) {
+
+      options = options || {};
+      this.globals = options.global || {};
+      this.listeners = [];
+      this.ignoredElements = $.extend({}, this.ignoredElements);
+
+      this.addListener = this.addListener.bind(this);
+      this.appendListener = this.appendListener.bind(this);
+      this.removeListener = this.removeListener.bind(this);
+      this.addGlobal = this.addGlobal.bind(this);
+      this.keydownHandler = this.keydownHandler.bind(this);
+
+      $(document.body).on( 'keydown', this.keydownHandler );
+
+    }, // init
+
+    destroy : function() {
+      $(document.body).off( 'keydown', this.keydownHandler );
+    }, // destroy
+
+    translate : function( keymap, map ) {
+      var metaRE = /^((?:(?:meta|shift|ctrl|alt)-)*)(.+)$/i,
+          self = this,
+          key, keyCode, result;
+
+      map = map || {};
+
+      function checkMeta( metas, fn ) {
+        return function(e) {
+          // Passes if all the metakeys pass
+          var pass = metas.map(function(m){
+            return m ? m.toLowerCase()+'Key' : null;
+          }).reduce(function(p,n){
+            return p && (n ? e.originalEvent[n] : true);
+          }, true);
+
+          if (pass) {
+            return fn.call(this, e);
+          }
+        };
+      }
+
+      for ( key in keymap ) {
+        if ( keymap.hasOwnProperty(key) ) {
+          result = metaRE.exec(key);
+          if ( !result ) { continue; }
+          // result[2] is the actual key
+          keyCode = this.constructor.keyCodes[result[2].toLowerCase()];
+          if ( keyCode ) {
+            map[keyCode] = map[keyCode] || $.Callbacks('unique stopOnFalse');
+            // result[1] is the meta modifiers
+            map[keyCode].add(result[1] ? checkMeta(result[1].split('-'), keymap[key]) : keymap[key]);
+          }
+        }
+      }
+
+      return map;
+    }, // translate
+
+    addListener : function( map ) {
+      this.listeners.push( this.translate( map ) );
+    }, // addListener
+
+    appendListener : function( map ) {
+      if (!this.listeners.length) {
+        this.listeners.push({});
+      }
+      this.translate( map, this.listeners[ this.listeners.length-1 ] );
+    }, // appendListener
+
+    removeListener : function() {
+      this.listeners.pop();
+    }, // removeListener
+
+    addGlobal : function( map ) {
+      this.translate( map, this.globals );
+    },
+
+    keydownHandler : function keydown(e) {
+
+      var topMap = this.listeners.length ? this.listeners[ this.listeners.length-1 ] : {};
+
+      if ( !(topMap.hasOwnProperty( e.which ) || this.globals.hasOwnProperty( e.which )) ) {
+        return;
+      }
+
+      // execute the top handler, if any
+      if (topMap[ e.which ] && ( this.constructor.bypassCodes[e.which] || !this.ignoredElements[ e.target.tagName ] ) ) {
+        topMap[ e.which ].fire(e);
+      }
+
+      // execute global handler
+      if ( this.globals[ e.which ] ) {
+        this.globals[ e.which ].fire(e);
+      }
+
+    }, // keydownHandler
+
+    keyupHandler : function keyup(e) {
+    } // keyupHandler
+
+  },{
+
+    keyCodes : {
+      'backspace' :8,
+      'tab'       :9,
+      'enter'     :13,
+      'shift'     :16,
+      'ctrl'      :17,
+      'alt'       :18,
+      'pause'     :19,
+      'capslock'  :20,
+      'escape'    :27,
+      'pageup'    :33,
+      'pagedown'  :34,
+      'end'       :35,
+      'home'      :36,
+      'left'      :37,
+      'up'        :38,
+      'right'     :39,
+      'down'      :40,
+      'insert'    :45,
+      'delete'    :46,
+      '0'         :48,
+      '1'         :49,
+      '2'         :50,
+      '3'         :51,
+      '4'         :52,
+      '5'         :53,
+      '6'         :54,
+      '7'         :55,
+      '8'         :56,
+      '9'         :57,
+      'a'         :65,
+      'b'         :66,
+      'c'         :67,
+      'd'         :68,
+      'e'         :69,
+      'f'         :70,
+      'g'         :71,
+      'h'         :72,
+      'i'         :73,
+      'j'         :74,
+      'k'         :75,
+      'l'         :76,
+      'm'         :77,
+      'n'         :78,
+      'o'         :79,
+      'p'         :80,
+      'q'         :81,
+      'r'         :82,
+      's'         :83,
+      't'         :84,
+      'u'         :85,
+      'v'         :86,
+      'w'         :87,
+      'x'         :88,
+      'y'         :89,
+      'z'         :90,
+      'f1'        :112,
+      'f2'        :113,
+      'f3'        :114,
+      'f4'        :115,
+      'f5'        :116,
+      'f6'        :117,
+      'f7'        :118,
+      'f8'        :119,
+      'f9'        :120,
+      'f10'       :121,
+      'f11'       :122,
+      'f12'       :123,
+      ';'         :186,
+      '='         :187,
+      ','         :188,
+      '-'         :189,
+      '.'         :190,
+      '/'         :191,
+      '`'         :192,
+      '['         :219,
+      '\\'        :220,
+      ']'         :221,
+      '\''        :222
+    },
+
+    bypassCodes : {
+      '16'  : true,
+      '17'  : true,
+      '18'  : true,
+      '19'  : true,
+      '20'  : true,
+      '27'  : true,
+      '45'  : true,
+      '112' : true,
+      '113' : true,
+      '114' : true,
+      '115' : true,
+      '116' : true,
+      '117' : true,
+      '118' : true,
+      '119' : true,
+      '120' : true,
+      '121' : true,
+      '122' : true,
+      '123' : true
+    }
+
+  }))();
+
+  return {
+    on : keyhandler.addListener,
+    off : keyhandler.removeListener,
+    add : keyhandler.appendListener,
+    global : keyhandler.addGlobal
+  };
+
+});
+
+define('be/View/Popup',['nbd/util/extend', 'be/View/Dialog', 'lib/keyboard'
+], function(extend, View, keyboard) {
+  'use strict';
+
+  var constructor = View.extend({
+
+    template : function(data) {
+      return this._super(extend({
+        dialogType : "desktop",
+        blocking   : true,
+        toolbar    : true
+      }, data));
+    },
+
+    render : function() {
+      constructor.Z_INDEX += 2;
+      this._zIndex = constructor.Z_INDEX;
+      return this._super.apply(this, arguments);
+    },
+
+    rendered : function() {
+      this._super();
+      this.$view.filter('.blocking-div')
+      .on('click', this.hide.bind(this));
+    },
+
+    position : function() {
+      if (!this.$view) { return; }
+
+      var $dialog = this.$view.filter('.popup');
+
+      var windowHeight = window.innerHeight ||
+        // IE compatibility
+        document.documentElement.offsetHeight,
+      offsetTop = (windowHeight - $dialog.outerHeight())/2;
+
+      // Manually center
+      $dialog.css({
+        "z-index" : this._zIndex,
+        "margin-left" : -~~($dialog.width()/2) + 'px',
+        "top" : offsetTop > 0 ? offsetTop : undefined
+      })
+      // Then show in position
+      .addClass('shown');
+
+      this.$view.filter('.blocking-div').css({
+        "z-index" : this._zIndex-1
+      });
+    },
+
+    show : function() {
+      if (!this.$view) { return; }
+      keyboard.on({'escape': this.hide.bind(this)});
+      if (!this.$view.parent().is(document.body)) {
+        this.$view.appendTo(document.body);
+      }
+      return this._super();
+    },
+
+    hide : function() {
+      if (!this.$view) { return; }
+      keyboard.off();
+      this.$view.detach();
+      return this._super();
+    },
+
+    toggle : function() {
+      var state = this.$view.parent().is(document.body);
+      return this[ state ? 'hide' : 'show' ]();
+    }
+
+  }, {
+    Z_INDEX: 250
+  });
+
+  return constructor;
+});
+
+
+define("require/hgn!templates/message", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<form class=\"send-message\">");t.b("\n" + i);t.b("  <div class=\"message-subject form-item form-item-text\">");t.b("\n" + i);t.b("    <input name=\"subject\" class=\"form-text form-text-normal\" type=\"text\" placeholder=\"Subject\" data-validate=\"required,Generic\">");t.b("\n" + i);t.b("  </div>");t.b("\n");t.b("\n" + i);if(t.s(t.f("body",c,p,1),c,p,0,235,249,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(t.rp("<textarea0",c,p,""));});c.pop();}t.b("</form>");t.b("\n");return t.fl(); },partials: {"<textarea0":{name:"textarea", partials: {}, subs: {  }}}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+
+define("require/hgn!templates/form/textarea", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div class=\"form-item form-item-textarea");if(t.s(t.f("containerClasses",c,p,1),c,p,0,61,67,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" ");t.b(t.v(t.d(".",c,p,0)));});c.pop();}t.b("\">");t.b("\n" + i);t.b("  ");if(t.s(t.f("label",c,p,1),c,p,0,103,142,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("<label for=\"");t.b(t.v(t.f("id",c,p,0)));t.b("\">");t.b(t.t(t.f("label",c,p,0)));t.b("</label>");});c.pop();}t.b("\n" + i);t.b("  <textarea id=\"");t.b(t.v(t.f("id",c,p,0)));t.b("\" name=\"");t.b(t.v(t.f("id",c,p,0)));t.b("\" class=\"form-textarea");if(t.s(t.f("classes",c,p,1),c,p,0,223,229,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" ");t.b(t.v(t.d(".",c,p,0)));});c.pop();}t.b("\"");t.b("\n" + i);t.b("    ");if(t.s(t.f("maxlength",c,p,1),c,p,0,261,287,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" maxlength=\"");t.b(t.v(t.f("maxlength",c,p,0)));t.b("\"");});c.pop();}t.b("\n" + i);t.b("    ");if(t.s(t.f("placeholder",c,p,1),c,p,0,322,352,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" placeholder=\"");t.b(t.v(t.f("placeholder",c,p,0)));t.b("\"");});c.pop();}t.b("\n" + i);t.b("    ");if(t.s(t.f("autocomplete",c,p,1),c,p,0,390,422,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(" autocomplete=\"");t.b(t.v(t.f("autocomplete",c,p,0)));t.b("\"");});c.pop();}t.b("\n" + i);t.b("    data-validate=\"");t.b(t.v(t.f("validate",c,p,0)));t.b("\">");t.b(t.v(t.f("value",c,p,0)));t.b("</textarea>");t.b("\n" + i);t.b("</div>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('be/trait/message',['hgn!templates/message',
+       'hgn!templates/form/textarea'
+], function(message, textarea) {
+  'use strict';
+
+  return {
+    mustache : message,
+
+    partials : {
+      textarea : textarea.template
+    },
+
+    templateData : function () {
+      return {
+        classes: ["message"],
+        title: "Message",
+        buttons: [{
+          label: "Send",
+          classes: ['form-button-default', 'form-submit']
+        }, {
+          label: "Cancel",
+          classes: ['form-button-cancel']
+        }],
+
+        contactName : this._model.get('name'),
+
+        body : {
+          id: "message",
+          placeholder: "Message",
+          container_classes: ['message-body'],
+          validate: "required,Generic",
+          classes: ['form-text-normal']
+        }
+      };
+    },
+
+    rendered : function() {
+      var self = this;
+      this.onSubmit(function(formData) {
+        this.then(function() {
+          self.hide();
+        });
+
+        return self.Controller.create(formData.subject, formData.message);
+      });
+
+      this.onCancel();
+      this._super();
+    }
+  };
+
+});
+
+define('be/trait/form/list',['jquery'], function($) {
+  'use strict';
+
+  // Make a select from a ul/ol
+  function makeSelect($ul, multiple) {
+    var $select = $('<select>', {
+      name: $ul[0].id,
+      multiple: multiple || false
+    }).hide();
+
+    // A singular select, empty default value
+    if (!multiple) {
+      $('<option>', {selected: true, disabled: true}).appendTo($select);
+    }
+
+    $ul.children('li').each(function() {
+      $('<option>', {value: $(this).data('value')}).appendTo($select);
+    });
+
+    $select.insertAfter($ul);
+    return $select;
+  }
+
+  function bindList($ul, multiple) {
+    $ul.each(function() {
+      var $select = makeSelect(
+        $(this).on('click', '>li', function() {
+          var $li = $(this),
+          val = $li.data('value'),
+          $option = $select.find('[value="'+val+'"]'),
+          selected = !$option.prop('selected');
+
+          // Set <option> selected state
+          $option.prop('selected', selected);
+          selected = $option.prop('selected');
+
+          (multiple ?
+            $ul.find('[data-value="'+val+'"]') :
+            $li.siblings().removeClass('active').end()
+          ).toggleClass('active', selected);
+        }), multiple);
+    });
+  }
+
+  return {
+    selectList: function($ul) {
+      bindList($ul || this.$view.find('ul,ol'), false);
+    },
+
+    multiList: function($ul) {
+      bindList($ul || this.$view.find('ul,ol'), true);
+    }
+  };
+
+});
+
+define('be/trait/form/toggle',['jquery'], function($) {
+  'use strict';
+
+  function makeCheckbox($el) {
+    var $checkbox = $('<input>', {
+      type: "checkbox",
+      name: $el[0].id,
+      value:"1",
+      checked: $el.hasClass('active')
+    }).hide();
+
+    $checkbox.insertAfter($el);
+    return $checkbox;
+  }
+
+  return {
+    /**
+     * Creates checkboxes out of arbitrary elements
+     * Toggles the active class on the element,
+     * backs it up using a hidden checkbox
+     */
+    toggleElement : function($el) {
+      $el.each(function(i) {
+        var $checkbox = makeCheckbox(i = $(this).on('click', function() {
+          var selected = !$checkbox.prop('checked');
+          $checkbox.prop('checked', selected).change();
+          i.toggleClass('active', selected);
+        }));
+      });
+    }
+  };
+});
+
+define('lib/validate',[],function() {
+  'use strict';
+
+  var check,
+  test = RegExp.prototype.test,
+  tests = {
+
+    "Generic":{
+      test : test.bind(/^[^<>]+$/),
+      message : "This field may not contain less than signs (&lt) or greater than signs (&gt;)"
+    },
+    "AlphaNumeric":{
+      test : test.bind(/^[0-9A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F]+$/),
+      message : "This field must contain only alphanumeric characters"
+    },
+    "Alpha":{
+      test : test.bind(/^[A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F]+$/),
+      message : "This field must contain only alpha characters"
+    },
+    "AlphaDash":{
+      test : test.bind(/^[A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F\-]+$/),
+      message : "This field must contain only alpha characters or dashes"
+    },
+    "ANDash":{
+      test : test.bind(/^[0-9A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F\-]+$/),
+      message : "This field must contain only alphanumeric characters or dashes"
+    },
+    "ANUnder":{
+      test : test.bind(/^[0-9A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F_]+$/),
+      message : "This field must contain only alphanumeric characters with or without underscores"
+    },
+    "ANUSpace":{
+      test : test.bind(/^[0-9A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F_ ]+$/),
+      message : "This field must contain only alphanumeric characters with or without underscores and spaces"
+    },
+    "ANEmail":{
+      test : test.bind(/^([_\dA-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F\-]+|[\w\.\+\-]+@(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]))$/),
+      message : "This field must contain a valid username or email"
+    },
+    "Integer":{
+      test : test.bind(/^\-?\d+$/),
+      message : "This field must only contain numbers, without any spaces"
+    },
+    "CreditCardNumber":{
+      test : test.bind(/^\d{13,16}$/),
+      message : "This field must only contain numbers, without any spaces or dashes"
+    },
+    "Decimal":{
+      test : test.bind(/^\-?\d+(\.\d+)?$/),
+      message : "This field must be a valid decimal number"
+    },
+    "Date":{
+      test : test.bind(/^\d{1,2}\-\d{1,2}-\d{4}( \d{2}:\d{2}:\d{2})?$/),
+      message : "This field must be a valid date"
+    },
+    "SqlDate":{
+      test : test.bind(/^\d{4}\-\d{2}\-\d{2}$/),
+      message : "This field must be a valid date"
+    },
+    "SqlDateTime":{
+      test : test.bind(/^\d{4}\-\d{2}\-\d{2}\s\d{2}\:\d{2}\:\d{2}$/),
+      message : "This field must be a valid datetime"
+    },
+    "SlashDate":{
+      test : test.bind(/^\d{1,2}\/\d{1,2}\/\d{4}$/),
+      message : "This field must be a valid date"
+    },
+    "Email":{
+      test : test.bind(/^[\w\.\+\-]+@(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$/),
+      message : "This field must be a valid email address"
+    },
+    "Name":{
+      test : test.bind(/^[\wA-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F\'. \-]{2,50}$/),
+      message : "This field must be a valid name"
+    },
+    "Username":{
+      test : test.bind(/^[A-Za-z0-9_\-]+$/),
+      message : "This field contains invalid characters. Please use only letters, numbers, dash or underscore characters."
+    },
+    "Password":{
+      test : test.bind(/^\S{6,32}$/),
+      message : "This field must be between 6 and 32 characters"
+    },
+    "Address":{
+      test : test.bind(/^[\w0-9A-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F# \' \.\,\&\-]+$/),
+      message : "This field must be a valid address"
+    },
+    "City":{
+      test : test.bind(/^[\wA-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F \' \. \-]+$/),
+      message : "This field must be a valid city"
+    },
+    "Province":{
+      test : test.bind(/^[\wA-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F ]+$/),
+      message : "This field must be a valid province"
+    },
+    "IntZip":{
+      test : test.bind(/^[A-Za-z0-9#\. \-]+$/),
+      message : "This field must be a valid zipcode"
+    },
+    "UsZip":{
+      test : test.bind(/^\d{5}(\-\d{4})?$/),
+      message : "This field must be a valid US zipcode"
+    },
+    "Country":{
+      test : test.bind(/^[\wA-Za-z\u00C0-\u00FF\u0100-\u0259\u0386\u0388-\u04E9\u05D0-\u06D3\u1E80-\u200F\'. \-]{2,50}$/),
+      message : "This field must be a valid country"
+    },
+    "IntPhone":{
+      test : test.bind(/^[0-9\+ \(\)\#\-]+$/),
+      message : "This field must be a valid phone"
+    },
+    "UsPhone":{
+      test : test.bind(/^\d{3}\-\d{3}\-\d{4}$/),
+      message : "This field must be a valid US phone"
+    },
+    "PicExt":{
+      test : test.bind(/^((jpg)|(jpeg)|(png)|(gif)){1}$/),
+      message : "This field must be a valid image extension"
+    },
+    "VideoExt":{
+      test : test.bind(/^((mpg)|(mpeg)|(mov)|(avi)|(dv)|(qt)|(asf)|(flv)){1}$/),
+      message : "This field must be a valid video extension"
+    },
+    "Url":{
+      test : test.bind(/^(http(?:s)?:\/\/|www.)[^<>]*$/),
+      message : "This field must be a URL starting with http:// or www."
+    },
+    "UrlExt":{
+      test : test.bind(/^((?:https?):\/\/)?(?:(?:(?:[\w\.\-\+!$&\'\(\)*\+,;=_]|%[0-9a-f]{2})+:)*(?:[\w\.\-\+%!$&\'\(\)*\+,;=]|%[0-9a-f]{2})+@)?(?:[A-Za-z0-9_\-]+\.)(?:[A-Za-z0-9\-\._])+(?::\d+)?(?:[\/|\?](?:[\w#!:\.\?\+=&@$\'~*,;_\/\(\)\[\]\-]|%[0-9a-f]{2})*)?$/),
+      message : "This field must be a valid URL"
+    },
+    "Html":{
+      test : function() {
+        return !test.apply(/<((?!\/?span|\/?h1|\/?h2|\/?h3|\/?h4|\/?h5|\/?h6|\/?a|\/?b|\/?ol|\/?ul|\/?li|\/?i|\/?em(?!bed)|\/?p|\/?div|\/?br|\/?unb|\/?uni|\/?\s|\/?\>)[^\>]*\>)/i, arguments);
+      },
+      message : "This field must be properly formed HTML"
+    },
+    "Twitter":{
+      test : test.bind(/^[A-Za-z0-9_\-]{1,15}$/),
+      message : "This field must be a valid twitter username (without the @ character)"
+    },
+
+    "required":{
+      test : test.bind(/.+/),
+      message : "This field is required"
+    },
+    "length":{
+      test : function(corpus, meta) {
+        var limits = /\[(,?\d+(?:,\d+)?)\]/.exec(meta);
+        corpus = String(corpus).replace(/[\s]+/g, ' ');
+
+        if (!limits) { return false; }
+        return (new RegExp('^.{'+limits[1]+'}$')).test( corpus );
+      },
+      message : function(corpus, meta) {
+        var limits;
+
+        limits = /\[(\d+),(\d+)\]/.exec(meta);
+        if (limits) {
+          return "Must be between "+limits[1]+" and "+limits[2]+" characters.";
+        }
+
+        limits = /\[,(\d+)\]/.exec(meta);
+        if (limits) {
+          return "Must be at most "+limits[1]+" characters.";
+        }
+
+        limits = /\[(\d+),\]/.exec(meta);
+        if (limits) {
+          return "Must be at least "+limits[1]+" characters.";
+        }
+
+        limits = /\[(\d+)\]/.exec(meta);
+        if (limits) {
+          return "Must be exactly "+limits[1]+" characters.";
+        }
+      }
+    }
+
+  },
+
+  // For extracting metada e.g. length[x,y]
+  metaRule = /(\w+)(.*)/;
+
+  function commaSplit(str) {
+    var i, buffer,
+    ignore = false,
+    start = 0,
+    result = [];
+
+    for (i=0; i < str.length; ++i) {
+      if (str[i]==='[') {
+        ignore = true;
+        continue;
+      }
+      if (str[i]===']') {
+        ignore = false;
+        continue;
+      }
+      if (str[i]===',' && !ignore) {
+        buffer = str.substring(start, i);
+        if ( buffer ) {
+          result.push(buffer);
+        }
+        start = i+1;
+      }
+    }
+
+    buffer = str.substring(start);
+    if ( buffer ) {
+      result.push(buffer);
+    }
+
+    return result;
+  }
+
+  function validate( body, rules ) {
+    var optional;
+
+    delete validate.message;
+    rules = rules ? commaSplit(rules) : [];
+    body = (body === null || body === undefined) ? '' : body;
+
+    optional = rules.indexOf('optional');
+
+    if (optional > -1) {
+      rules.splice(optional, optional + 1);
+      return !body || rules.every(check, body);
+    }
+    else {
+      return rules.every(check, body);
+    }
+  }
+
+  // Per rule check
+  check = function (rule) {
+    var res = metaRule.exec(rule),
+    meta;
+
+    if (res) {
+      rule = res[1];
+      meta = res[2];
+    }
+
+    if (!(tests[rule] && tests[rule].test)) {
+      return true;
+    }
+
+    res = tests[rule].test(this, meta);
+
+    if (!res) {
+      validate.message = typeof tests[rule].message === 'function' ?
+        tests[rule].message(this, meta) :
+        tests[rule].message;
+    }
+
+    return res;
+  };
+
+  return validate;
+
+});
+
+define('lib/tooltip',[
+  'jquery'
+], function($) {
+  'use strict';
+
+  function tooltip($context, message, classes, appendAfter) {
+    var $formItem, $tooltip;
+
+    classes = classes || [];
+    appendAfter = appendAfter || false;
+
+    $formItem = $context.closest('.js-form-item, .form-item');
+    if (!$formItem.length) {
+      $formItem = $context;
+    }
+
+    $tooltip = $('<div>' + message + '</div>')
+                .addClass(classes.join(' '));
+
+    // Either append it after the form-item at the same level in the DOM or append it
+    // inside the form-item element itself
+    if (!!appendAfter) {
+      $formItem.after($tooltip);
+    }
+    else {
+      $tooltip.appendTo($formItem);
+    }
+
+    // Have to hard code 8 in here as it's the border-height of
+    // the :after style that creates a triangle
+    $tooltip.css('top', -(($tooltip.outerHeight() + 8) - $context.position().top));
+
+    // Apply class to form-item element since certain error sytles require that.
+    $formItem.addClass('form-item-error');
+
+    return $tooltip;
+  }
+
+  return tooltip;
+});
+
+define('lib/showMessages',['jquery'], function ($) {
+  'use strict';
+
+  function showMessages($form, messages, options) {
+    options = $.extend({
+      fade : true,
+      floating : false,
+      prepend : false
+    }, options);
+
+    var $container = $form.find('.messages'),
+        msgs       = [];
+
+    if (!$container.length) {
+      $container = $('<div class="messages"></div>').hide().addClass(options.classes || '');
+
+      if (options.floating) {
+        $container.addClass('messages-floating');
+      }
+
+      if (options.prepend) {
+        $container.prependTo( $form );
+      }
+      else {
+        $container.appendTo( $form );
+      }
+    }
+
+    messages.forEach(function(msg) {
+      msg.type = msg.type || 'message';
+
+      var msg_str;
+
+      switch ( msg.type ) {
+        case 'error' :
+        case 'message' :
+        case 'success' :
+          break;
+
+        default :
+          throw ('"' + msg.type +'" is not a valid message type');
+      }
+
+      msg_str = '<div class="' + msg.type + '">' +
+                '<span class="icon-status-' + msg.type + ' icon sprite-site-elements"></span>' +
+                msg.message +
+                '</div>';
+
+      msgs.push(msg_str);
+    });
+
+    $container.html(msgs.join('')).show();
+
+    if (options.fade) {
+      $container.delay(5000).fadeOut(1000);
+    }
+  };
+
+  return showMessages;
+});
+
+define('be/trait/form/submit',['jquery',
+       'nbd/trait/promise',
+       'nbd/util/media',
+       'lib/validate',
+       'lib/tooltip',
+       'lib/showMessages'
+], function($, Promise, media, validator, tooltip, showMessages) {
+  'use strict';
+
+  function formFormat(obj, entry) {
+    // Format into { name: value }
+    var val = obj[ entry.name ];
+    obj[ entry.name ] = val ?
+      // Format selects into { name: [value1, value2,...] }
+      [].concat(val, entry.value) :
+      entry.value;
+    return obj;
+  }
+
+  var validate = function( data ) {
+    var invalid = {};
+
+    Object.keys(data).forEach(function(key) {
+      var rule = this.find('[name="'+key+'"]').data('validate');
+      if ( !validator(data[key], rule) ) {
+        invalid[key] = validator.message;
+      }
+    }, this);
+
+    if (Object.keys(invalid).length) {
+      throw invalid;
+    }
+    return data;
+  };
+
+  return {
+
+    continuousValidation: function () {
+      var $inputs = this.$view.find('input, textarea');
+
+      $inputs.each(function () {
+        var $input = $(this),
+            rule = $input.data('validate');
+
+        $input.on('blur', function () {
+          // Remove any previous error messages
+          $input.parent().find('.form-error').remove();
+
+          if (!validator($input.val(), rule)) {
+            tooltip($input, validator.message);
+          }
+        });
+      });
+    },
+
+    onSubmit : function(commit, $context, preserveInputs) {
+      $context = $context || this.$view;
+
+      var $form = $context.is('form') ? $context : $context.find('form');
+
+      $context.on('click keydown', '.form-submit:not([type=submit])', function(e) {
+        switch (e.which) {
+          // Left mouse
+          case 1:
+          // Enter
+          case 13:
+          // Spacebar
+          case 32:
+            $form.submit();
+          break;
+        }
+      });
+
+      $form.on('submit', function(e) {
+        var action = new Promise(),
+        // Gather form data
+        formData = $form.serializeArray().reduce(formFormat, {}),
+
+        // $.ajax() options object
+        formMetadata = {
+          url  : $form.attr('action'),
+          type : $form.attr('method') || 'POST'
+        };
+
+        // Make sure original event exists, so that post promise bindings
+        // have access to the promise.
+        e.originalEvent = e.originalEvent || {};
+
+        // Remove any previously generated error tooltips
+        $form.find('.form-error').remove();
+        $form.find('.form-item-error').removeClass('form-item-error');
+
+        e.originalEvent.promise = (
+          // Ignore VForm printed onsubmit attribute
+          e.isDefaultPrevented() && !$form.attr('onsubmit') ?
+          action :
+          action.then(validate.bind($form))
+        )
+        // AJAX/Customization
+        .then(function(data) {
+          formMetadata.data = data;
+          /*
+          * Default case is to ajax with form options and form data.
+          */
+          if ( typeof commit !== 'function' ) {
+            return $.ajax(formMetadata);
+          }
+
+          /*
+          * If given a custom handler, let the handler to determine what to do.
+          * The handler's context is the chain, and if the chain is returned,
+          * run the default ajax to start the promise chain.
+          */
+          var chain = new Promise(),
+          then = chain.thenable(),
+          retval = commit.call(then, data);
+          chain.resolve(retval === then ?
+                        $.ajax(formMetadata) :
+                        retval);
+          return chain;
+        })
+        .then(function success() {
+          // Success
+          if (!preserveInputs) {
+            $form.find(':input').val('').removeAttr('checked selected');
+          }
+        }, function failure(reason) {
+          var errors, tooltipClasses;
+
+          // Actual Error
+          if (reason instanceof Error) {
+            console.error(reason);
+            return;
+          }
+
+          // Non-200 response
+          if (reason.responseJSON) {
+            reason = reason.responseJSON;
+          }
+
+          if (reason.messages) {
+            showMessages($form, reason.messages);
+          }
+
+          console.warn(reason);
+
+          errors = reason.errors || reason;
+
+          tooltipClasses = media.is('desktop') ? ['form-error'] : ['form-error', 'form-error-right'];
+          Object.keys(errors).forEach(function (key) {
+            tooltip($form.find('[name='+ key +']'), errors[key], tooltipClasses);
+          });
+
+          throw reason;
+        });
+
+        action.resolve(formData);
+
+        return false;
+      });
+    },
+
+    onCancel : function(cancel) {
+      this.$view.on('click', '.form-button-cancel', function() {
+        // Blank text fields and areas
+        this.$view.find('.form-text, .form-textarea').val('');
+
+        if ( typeof cancel === 'function' ) {
+          cancel();
+        }
+      }.bind(this));
+    }
+
+  };
+
+});
+
+define('be/trait/form',['nbd/util/extend',
+       'be/trait/form/list',
+       'be/trait/form/toggle',
+       'be/trait/form/submit',
+], function(extend, list, toggle, submit) {
+  'use strict';
+
+  return extend( {}, submit, list, toggle );
+
+});
+
+define('be/Controller/Dialog/Message',[
+  'jquery',
+  'nbd/event',
+  'be/Controller/Dialog/Roulette',
+  'be/View/Dialog/Layover',
+  'be/View/Menu',
+  'be/View/Popup',
+  'be/trait/message',
+  'be/trait/form'
+], function($, event, Controller, Layover, Menu, Popup, message, form) {
+  'use strict';
+
+  var constructor = Controller.extend({
+    create : function(subject, message) {
+      // All these options are (howdobrainlearn)
+      return $.ajax({
+        url : '/inbox/compose',
+        type : 'POST',
+        data : {
+          from_profile: 1,
+          to_types : 1,
+          to_ids : this._model.get('id'),
+          subject : subject,
+          inbox_message : message
+        }
+      });
+    },
+
+    render : function($context) {
+      if (!$(document.body).hasClass('logged-in')) { return; }
+
+      this.$source = $($context);
+      this.Model.set({
+        id : this.$source.data('contact_id') || this.$source.attr('contact_id'),
+        name : this.$source.data('contact_name')
+      });
+      this._super($context);
+    }
+  }, {
+    VIEW_CLASS : {
+      phone   : Layover.extend(message).mixin(form),
+      tablet  : Menu.extend(message).mixin(form),
+      desktop : Popup.extend(message).extend({
+        templateData : function() {
+          var data = this._super();
+          data.title = "Send Message to " + data.contactName;
+          return data;
+        }
+      }).mixin(form)
+    }
+  });
+
+  return constructor;
+});
+
+/*!
+ * js-logger - http://github.com/jonnyreeves/js-logger
+ * Jonny Reeves, http://jonnyreeves.co.uk/
+ * js-logger may be freely distributed under the MIT license.
+ */
+
+/*jshint sub:true*/
+/*global window:true,define:true, module:true*/
+(function (window) {
+    "use strict";
+
+	// Top level module for the global, static logger instance.
+	var Logger = { };
+
+	// For those that are at home that are keeping score.
+	Logger.VERSION = "0.9.2";
+
+	// Function which handles all incoming log messages.
+	var logHandler;
+
+	// Map of ContextualLogger instances by name; used by Logger.get() to return the same named instance.
+	var contextualLoggersByNameMap = {};
+
+	// Polyfill for ES5's Function.bind.
+	var bind = function(scope, func) {
+		return function() {
+			return func.apply(scope, arguments);
+		};
+	};
+
+	// Super exciting object merger-matron 9000 adding another 100 bytes to your download.
+	var merge = function () {
+		var args = arguments, target = args[0], key, i;
+		for (i = 1; i < args.length; i++) {
+			for (key in args[i]) {
+				if (!(key in target) && args[i].hasOwnProperty(key)) {
+					target[key] = args[i][key];
+				}
+			}
+		}
+		return target;
+	};
+
+	// Helper to define a logging level object; helps with optimisation.
+	var defineLogLevel = function(value, name) {
+		return { value: value, name: name };
+	};
+
+	// Predefined logging levels.
+	Logger.DEBUG = defineLogLevel(1, 'DEBUG');
+	Logger.INFO = defineLogLevel(2, 'INFO');
+	Logger.WARN = defineLogLevel(4, 'WARN');
+	Logger.ERROR = defineLogLevel(8, 'ERROR');
+	Logger.OFF = defineLogLevel(99, 'OFF');
+
+	// Inner class which performs the bulk of the work; ContextualLogger instances can be configured independently
+	// of each other.
+	var ContextualLogger = function(defaultContext) {
+		this.context = defaultContext;
+		this.setLevel(defaultContext.filterLevel);
+		this.log = this.debug;  // Convenience alias.
+	};
+
+	ContextualLogger.prototype = {
+		// Changes the current logging level for the logging instance.
+		setLevel: function(newLevel) {
+			// Ensure the supplied Level object looks valid.
+			if (newLevel && "value" in newLevel) {
+				this.context.filterLevel = newLevel;
+			}
+		},
+
+		// Is the logger configured to output messages at the supplied level?
+		enabledFor: function (lvl) {
+			var filterLevel = this.context.filterLevel;
+			return lvl.value >= filterLevel.value;
+		},
+
+		debug: function () {
+			this.invoke(Logger.DEBUG, arguments);
+		},
+
+		info: function () {
+			this.invoke(Logger.INFO, arguments);
+		},
+
+		warn: function () {
+			this.invoke(Logger.WARN, arguments);
+		},
+
+		error: function () {
+			this.invoke(Logger.ERROR, arguments);
+		},
+
+		// Invokes the logger callback if it's not being filtered.
+		invoke: function (level, msgArgs) {
+			if (logHandler && this.enabledFor(level)) {
+				logHandler(msgArgs, merge({ level: level }, this.context));
+			}
+		}
+	};
+
+	// Protected instance which all calls to the to level `Logger` module will be routed through.
+	var globalLogger = new ContextualLogger({ filterLevel: Logger.OFF });
+
+	// Configure the global Logger instance.
+	(function() {
+		// Shortcut for optimisers.
+		var L = Logger;
+
+		L.enabledFor = bind(globalLogger, globalLogger.enabledFor);
+		L.debug = bind(globalLogger, globalLogger.debug);
+		L.info = bind(globalLogger, globalLogger.info);
+		L.warn = bind(globalLogger, globalLogger.warn);
+		L.error = bind(globalLogger, globalLogger.error);
+
+		// Don't forget the convenience alias!
+		L.log = L.debug;
+	}());
+
+	// Set the global logging handler.  The supplied function should expect two arguments, the first being an arguments
+	// object with the supplied log messages and the second being a context object which contains a hash of stateful
+	// parameters which the logging function can consume.
+	Logger.setHandler = function (func) {
+		logHandler = func;
+	};
+
+	// Sets the global logging filter level which applies to *all* previously registred, and future Logger instances.
+	// (note that named loggers (retrieved via `Logger.get`) can be configured indendently if required).
+	Logger.setLevel = function(level) {
+		// Set the globalLogger's level.
+		globalLogger.setLevel(level);
+
+		// Apply this level to all registered contextual loggers.
+		for (var key in contextualLoggersByNameMap) {
+			if (contextualLoggersByNameMap.hasOwnProperty(key)) {
+				contextualLoggersByNameMap[key].setLevel(level);
+			}
+		}
+	};
+
+	// Retrieve a ContextualLogger instance.  Note that named loggers automatically inherit the global logger's level,
+	// default context and log handler.
+	Logger.get = function (name) {
+		// All logger instances are cached so they can be configured ahead of use.
+		return contextualLoggersByNameMap[name] ||
+			(contextualLoggersByNameMap[name] = new ContextualLogger(merge({ name: name }, globalLogger.context)));
+	};
+
+	// Configure and example a Default implementation which writes to the `window.console` (if present).
+	Logger.useDefaults = function(defaultLevel) {
+		// Check for the presence of a logger.
+		if (!("console" in window)) {
+			return;
+		}
+
+		var console = window.console;
+		Logger.setLevel(defaultLevel || Logger.DEBUG);
+		Logger.setHandler(function(messages, context) {
+			var hdlr = console.log;
+
+			// Prepend the logger's name to the log message for easy identification.
+			if (context.name) {
+				Array.prototype.splice.call(messages, 0, 0, "[" + context.name + "]");
+			}
+
+			// Delegate through to custom warn/error loggers if present on the console.
+			if (context.level === Logger.WARN && console.warn) {
+				hdlr = console.warn;
+			} else if (context.level === Logger.ERROR && console.error) {
+				hdlr = console.error;
+			} else if (context.level === Logger.INFO && console.info) {
+				hdlr = console.info;
+			}
+
+			hdlr.apply(console, messages);
+		});
+	};
+
+
+    // Export to popular environments boilerplate.
+    if (typeof define === 'function' && define.amd) {
+        define('log',Logger);
+    }
+    else if (typeof module !== 'undefined' && module.exports) {
+        module.exports = Logger;
+    }
+    else {
+        window['Logger'] = Logger;
+    }
+}(window));
+
+
+define("require/hgn!templates/project/collection", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<form>");t.b("\n" + i);t.b("  <div class=\"form-item form-item-text form-item-siamese left\">");t.b("\n" + i);t.b("    <input type=\"text\" placeholder=\"Create a New Collection\"");t.b("\n" + i);t.b("    name=\"collection\" class=\"form-text\">");t.b("\n" + i);t.b("  </div>");t.b("\n" + i);t.b("  <div class=\"form-item form-item-a form-item-siamese left\">");t.b("\n" + i);t.b("    <a class=\"form-button form-submit form-button-light-and-grey\">Add</a>");t.b("\n" + i);t.b("  </div>");t.b("\n");t.b("\n" + i);t.b("  <ul id=\"collection_ids\" class=\"divided-list");if(!t.s(t.f("collections",c,p,1),c,p,1,0,0,"")){t.b(" empty");};t.b("\">");t.b("\n" + i);if(t.s(t.f("collections",c,p,1),c,p,0,433,511,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("    <li class=\"divided-item collection\" data-key=\"");t.b(t.v(t.f("id",c,p,0)));t.b("\">");t.b(t.v(t.f("title",c,p,0)));t.b("</li>");t.b("\n" + i);});c.pop();}t.b("  </ul>");t.b("\n" + i);t.b("</form>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('project/trait/collection',['jquery',
+       'hgn!templates/project/collection',
+], function($, collection) {
+  'use strict';
+
+  return {
+    mustache : collection,
+
+    title : "Collections",
+
+    templateData : function() {
+      return $.extend({
+        classes: ['collections'],
+        title : this.title,
+        button : {
+          label: 'Save',
+          containerClasses: ['left'],
+          classes: ['form-button-default', 'collections-save', 'form-button-small' ]
+        },
+        buttons : [{
+          label: 'Save',
+          classes: ['form-button-default', 'collections-save']
+        }]
+      }, this._model.data());
+    },
+
+    rendered : function() {
+      this._super();
+      this.bindSelections();
+      this.newCollection();
+      this.saveCollections();
+    },
+
+    saveCollections : function() {
+      this.$view.on('click', '.collections-save', function() {
+        this.Controller.update();
+        this.hide();
+      }.bind(this));
+    },
+
+    // for create new collection 'siamese' input
+    newCollection : function() {
+      var $form = this.$view.find('form');
+
+      $form.on('submit', function(e) {
+        var data = $form.serializeArray(),
+        name = data[0].value;
+
+        this.Controller.create(name)
+        .then(function() {
+          this.render();
+          this.position();
+          this.show();
+        }.bind(this) );
+
+        return false;
+      }.bind(this) )
+      .on('click', '.form-submit', function() {
+        $form.submit();
+      });
+    },
+
+    bindSelections : function() {
+      var self = this;
+
+      this.select( this._model.get('project_collection_ids') );
+      this.listenTo( this._model, 'project_collection_ids', this.select );
+
+      this.$view.on('click', '.collection', function() {
+        var i,
+        key = $(this).data('key'),
+        ids = self._model.get('project_collection_ids');
+
+        // key found
+        if (~(i = ids.indexOf(key))) {
+          // remove
+          ids.splice(i,1);
+        }
+        else {
+          ids.push(key);
+        }
+
+        // manually trigger model events (arrays don't detect change)
+        self._model.trigger('project_collection_ids', ids);
+      });
+    },
+
+    select : function(selected) {
+      this.$view.find('.collection').removeClass('active');
+
+      return selected && selected.forEach(function(id) {
+        this.$view.find('.collection[data-key='+id+']')
+        .addClass('active');
+      }, this);
+    }
+  };
+
+});
+
+define('project/Controller/Collection',[
+  'log',
+  'moment',
+  'lib/xhr',
+  'be/Controller/Dialog/Roulette',
+  'be/View/Dialog/Layover',
+  'be/View/Menu',
+  'be/View/Popup',
+  'project/trait/collection'
+], function( log, moment, xhr, Controller, Layover, Menu, Popup, collection) {
+  'use strict';
+
+  log = log.get( 'Project Collection' );
+  log.error = log.error.bind( log );
+
+  var constructor = Controller.extend({
+
+    create : function(name) {
+      return xhr({
+        url : '/collection/create',
+        type : 'POST',
+        data : { collection_name: name }
+      })
+      .then(function(data) {
+        var id = data.id, timestamp = +moment().format('X');
+
+        if (!id) { throw data; }
+
+        return {
+          id : id,
+          title : name,
+          owners : [],
+          url : "/collection/"+ encodeURIComponent(name) +"/"+id,
+          created_on : timestamp,
+          modified_on : timestamp
+        };
+
+      })
+      .then(function(data) {
+        this.Model.get('collections').unshift(data);
+        this.Model.get('project_collection_ids').unshift(data.id);
+
+        // Auto-update after the creation
+        this.update();
+        return data;
+      }.bind(this), log.error);
+    },
+
+    read : function() {
+      var p = xhr({
+        url : '/gallery/collections/' + this.Model.id()
+      })
+      .then(function(data) {
+        if ( !data.project_collection_ids ) { throw data; }
+
+        data.collections.sort(function(a, b) {
+          return data.project_collection_ids.indexOf(+b.id) -
+            data.project_collection_ids.indexOf(+a.id);
+        });
+
+        return data;
+      });
+
+      p.then( this.Model.set.bind(this.Model), log.error );
+      return p;
+    },
+
+    update : function() {
+      return xhr({
+        url : '/collection/project/' + this.Model.id(),
+        type : 'POST',
+        data : { collection_ids : this.Model.get('project_collection_ids').join('|') }
+      })
+      .then(null, log.error);
+    },
+
+    render : function() {
+      var self = this,
+      _super = this._super,
+      renderArgs = arguments;
+
+      // delay render till after collections are gotten
+      this.read()
+      .then(function() { _super.apply(self, renderArgs); })
+      .then( this.View.show.bind(this.View) );
+    }
+
+  }, {
+    VIEW_CLASS : {
+      phone   : Layover.extend(collection),
+      tablet  : Menu.extend(collection),
+      desktop : Popup.extend(collection).mixin({ title : "Add to Collections" })
+    }
+  });
+
+  return constructor;
+});
+
+// Events for scrolling past points in pages
+define('lib/scrollpoint',['jquery'], function($) {
+  'use strict';
+
+  var percent = /(\d+)%/,
+      $window = $(window),
+      $document = $(document),
+      registry = {};
+
+  function isPercent(breakpoint) {
+    return percent.test(breakpoint) || (breakpoint > 0 && breakpoint < 1);
+  }
+
+  function normalize(breakpoint) {
+
+    if ( $.isNumeric(breakpoint) ) {
+      return parseFloat(breakpoint);
+    }
+
+    var value = percent.exec(breakpoint);
+
+    // Percentage breakpoint
+    if (value) {
+      return (value[1] / 100);
+    }
+
+    return parseInt(breakpoint, 10);
+  }
+
+  function elementHeight($context) {
+    return $context.is($window) ?
+           ($document.height() - (window.innerHeight || $window.height())) :
+           $context.prop('scrollHeight');
+  }
+
+  function check(breakpoint, scrolled, $context) {
+    return (scrolled >
+            (isPercent(breakpoint) ?
+             breakpoint * elementHeight($context) :
+             parseInt(breakpoint, 10)
+            )
+           );
+  }
+
+  function scroll(context) {
+    var $context = context === 'window' ? $window : $(context);
+
+    return function () {
+      var breakpoint, cb, cache,
+      scrolled = $context.scrollTop();
+
+      for (breakpoint in registry[context]) {
+        cb = registry[context][breakpoint];
+        cache = check(breakpoint, scrolled, $context);
+
+        cb.cache = cb.cache || false;
+
+        if (cb.cache !== cache) {
+          cb.fire(cache);
+          cb.cache = cache;
+        }
+      }
+    };
+  }
+
+  function register(breakpoint, callback, context) {
+    breakpoint = normalize(breakpoint);
+
+    var cb = registry[context][breakpoint];
+
+    if (!cb) {
+      cb = registry[context][breakpoint] = new $.Callbacks();
+    }
+
+    cb.add(callback);
+  }
+
+  function unregister(breakpoint, callback, context) {
+    context = context || 'window';
+
+    var bp;
+
+    if (callback) {
+      if (breakpoint) {
+        registry[context][breakpoint].remove(callback);
+        return;
+      }
+
+      for (bp in registry[context]) {
+        registry[context][bp].remove(callback);
+      }
+      return;
+    }
+
+    if (typeof breakpoint === 'string') {
+      registry[context][breakpoint].empty();
+      delete registry[context][breakpoint];
+    }
+
+    if (context) {
+      delete registry[context];
+    }
+  }
+
+  /**
+   * @param breakpoint {Number|String} Number of pixels scrolled down
+   * or percentage of context height e.g. '50%' or 0.5
+   * @param callback {Function}
+   * @param context {DOM|jQuery}
+   */
+  function scrollpoint(breakpoint, callback, context) {
+    context = context || 'window';
+
+    var $context = context === 'window' ? $window : $(context),
+        point;
+
+    if (!registry.hasOwnProperty(context)) {
+      registry[context] = {};
+      $context.on('scroll', scroll(context));
+    }
+
+    if (typeof breakpoint === 'object') {
+      for (point in breakpoint) {
+        register(point, breakpoint[point], context);
+      }
+      return;
+    }
+
+    return register(breakpoint, callback, context);
+  }
+
+  scrollpoint.on = scrollpoint;
+  scrollpoint.off = unregister;
+
+  return scrollpoint;
+});
+
+
+define("require/hgn!templates/project/viralIcons", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div class=\"viral-icons\">");t.b("\n" + i);t.b("  <a href=\"https://twitter.com/share\" class=\"viral-button twitter-share-button viral-button-twitter\" data-url=\"");t.b(t.v(t.f("url",c,p,0)));t.b("\" data-text=\"");t.b(t.v(t.f("title",c,p,0)));t.b("\" data-via=\"Behance\" data-count=\"none\">Tweet</a>");t.b("\n");t.b("\n" + i);t.b("  <span class=\"viral-button viral-button-linkedin\"><script type=\"IN/Share\" data-url=\"");t.b(t.v(t.f("url",c,p,0)));t.b("\"></script></span>");t.b("\n");t.b("\n" + i);t.b("  <div class=\"viral-button viral-button-pinterest\"></div>");t.b("\n");t.b("\n" + i);t.b("  <span class=\"viral-button viral-button-stumble\"><su:badge layout=\"4\" location=\"");t.b(t.v(t.f("url",c,p,0)));t.b("\"></su:badge></span>");t.b("\n");t.b("\n" + i);t.b("  <div class=\"fb-like\" data-send=\"false\" data-layout=\"button_count\" data-width=\"90\" data-show-faces=\"false\"></div>");t.b("\n" + i);t.b("</div>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+// Sticky Plugin v1.0.0 for jQuery
+// =============
+// Author: Anthony Garand
+// Improvements by German M. Bravo (Kronuz) and Ruud Kamphuis (ruudk)
+// Improvements by Leonardo C. Daronco (daronco)
+// Behance Mods: Sean Dunn
+// Created: 2/14/2011
+// Date: 2/12/2012
+// Date (Mod): 6/19/2013
+// Website: http://labs.anthonygarand.com/sticky
+// Description: Makes an element on the page stick on the screen as you scroll
+//       It will only set the 'top' and 'position' of your element, you
+//       might need to adjust the width in some cases.
+
+(function($) {
+  var defaults = {
+      topSpacing: 0,
+      bottomSpacing: 0,
+      className: 'is-sticky',
+      wrapperClassName: 'sticky-wrapper',
+      center: false,
+      getWidthFrom: ''
+    },
+    $document = $(document),
+    sticked = [],
+    scroller = function($context) {
+      var scrollTop = $context.scrollTop(),
+        windowHeight = $(window).height(),
+        documentHeight = $context.is($(window)) ? $(document).height() : $context.height(),
+        dwh = documentHeight - windowHeight,
+        extra = (scrollTop > dwh) ? dwh - scrollTop : 0;
+
+      for (var i = 0; i < sticked.length; i++) {
+        var s = sticked[i],
+          elementTop = $context.is($(window)) ? s.stickyWrapper.offset().top : s.stickyWrapper.offset().top - $context.offset().top,
+          etse = elementTop - s.topSpacing - extra;
+
+        if (scrollTop <= etse) {
+          if (s.currentTop !== null) {
+            s.stickyElement
+              .css('position', '')
+              .css('top', '');
+            s.stickyElement.removeClass(s.className);
+            s.currentTop = null;
+          }
+        }
+        else {
+          var newTop = documentHeight - s.stickyElement.outerHeight()
+            - s.topSpacing - s.bottomSpacing - scrollTop - extra;
+          if (newTop < 0) {
+            newTop = newTop + s.topSpacing;
+          } else {
+            newTop = s.topSpacing;
+          }
+          if (s.currentTop != newTop) {
+            s.stickyElement
+              .css('position', 'fixed')
+              .css('top', newTop);
+
+            if (typeof s.getWidthFrom !== 'undefined') {
+              s.stickyElement.css('width', $(s.getWidthFrom).width());
+            }
+
+            s.stickyElement.addClass(s.className);
+            s.currentTop = newTop;
+          }
+        }
+      }
+    },
+    methods = {
+      init: function(options, $context) {
+        $context = $context || $(window);
+
+        var o = $.extend({}, defaults, options);
+
+        $context.each(function () {
+          if (this.addEventListener) {
+            this.addEventListener('scroll', function () { scroller($context); }, false);
+          } else if (this.attachEvent) {
+            this.attachEvent('onscroll', function () { scroller($context); });
+          }
+        });
+
+        return this.each(function() {
+          var stickyElement = $(this),
+          stickyId = stickyElement.attr('id'),
+          wrapper = $('<div></div>')
+            .attr('id', stickyId + '-sticky-wrapper')
+            .addClass(o.wrapperClassName);
+
+          stickyElement.wrapAll(wrapper);
+
+          if (o.center) {
+            stickyElement.parent().css({width:stickyElement.outerWidth(),marginLeft:"auto",marginRight:"auto"});
+          }
+
+          if (stickyElement.css("float") == "right") {
+            stickyElement.css({"float":"none"}).parent().css({"float":"right"});
+          }
+
+          var stickyWrapper = stickyElement.parent();
+          stickyWrapper.css('height', stickyElement.outerHeight());
+          var stickyData = {
+            topSpacing: o.topSpacing,
+            bottomSpacing: o.bottomSpacing,
+            stickyElement: stickyElement,
+            currentTop: null,
+            stickyWrapper: stickyWrapper,
+            className: o.className,
+            getWidthFrom: o.getWidthFrom
+          };
+
+          stickyElement.data('sticky', stickyData);
+          sticked.push(stickyData);
+        });
+      },
+      update: function ($context) {
+        $context = $context || $(window);
+
+        scroller($context);
+      }
+    };
+
+  $.fn.sticky = function(method) {
+    if (methods[method]) {
+      return methods[method].apply(this, Array.prototype.slice.call(arguments, 1));
+    } else if (typeof method === 'object' || !method ) {
+      return methods.init.apply( this, arguments );
+    } else {
+      $.error('Method ' + method + ' does not exist on jQuery.sticky');
+    }
+  };
+  $(function() {
+    setTimeout(function () { scroller($(window)); }, 0);
+  });
+})(jQuery);
+
+define("jquery/plugins/jquery.sticky", function(){});
+
+define('project/lib/stickyBar',[
+  'jquery',
+  'lib/scrollpoint',
+  'lib/social',
+  'be/follow',
+  'be/Controller/Dialog/Message',
+  'project/Controller/Collection',
+  'hgn!templates/project/viralIcons',
+  'jquery/plugins/jquery.sticky'
+], function($, scrollpoint, social, follow, Message, Collection, viralIcons) {
+  'use strict';
+
+  // Adjusts sticky top/bottom spacing
+  // according to other occluding elements
+  return {
+    init : function(root, $context, config) {
+
+      var breakpoint = $context.is($(document.body)) ? root.height() + root.offset().top : root.height(),
+          $sidebar = $('<div id="sticky-sidebar"></div>)')
+                     .append($('.sidebar-owner', root).clone())
+                     .append($('.sidebar-actions', root).clone());
+
+      // follow button
+      follow.init($sidebar);
+
+      // message button
+      this.message = new Message();
+      this.message.setContext( $sidebar.find('.send-message') );
+
+      // save to collection
+      this.collection = new Collection(config.project.id);
+      this.collection.setContext( $sidebar.find('.add-to-collection') );
+
+      // share buttons
+      $sidebar.find('.viral-icons')
+      .html(viralIcons({
+        url: document.location.href,
+        title: document.title,
+        no_pinterest: config.project.copyright.license === "no-use"
+      }));
+
+      scrollpoint(breakpoint, function (state) {
+        if (state && root.find('#sticky-sidebar').length < 1) {
+          root.append($sidebar);
+          social.init($sidebar);
+
+          $sidebar.sticky({
+            topSpacing : $('#navmenui-shuffle').outerHeight() +
+              $('.showcase-bar').outerHeight(),
+            bottomSpacing : $('#site-footer').height() +
+              parseInt( $('#content-container').css('margin-bottom'), 10 )
+          }, $context.is($(document.body)) ? $(window) : $('#project-popup') );
+        }
+      }, $context.is($(document.body)) ? 'window' : '#project-popup');
+    },
+
+    destroy : function (context) {
+      scrollpoint.off(null, null, context);
+    }
+  };
+});
+
+define('project/View/Curation',['nbd/View'], function(View) {
+  'use strict';
+
+  var constructor = View.extend({
+    init: function($view, model) {
+      this.$view = $view;
+      this._model = model;
+      this.rendered();
+    },
+
+    destroy: function() {
+      this._model.off(null, null, this);
+    },
+
+    rendered: function() {
+      var self = this;
+
+      this._model.on('queued', function(queued) {
+        this.$view.toggleClass('queued', queued);
+
+        if (queued) {
+          this.$view.addClass('queued-hold')
+          .one('mouseleave', function() {
+            $(this).removeClass('queued-hold');
+          });
+        }
+      }, this);
+
+      this.$view.on('click', function() {
+        self._controller.queue();
+      });
+    }
+  });
+
+  return constructor;
+});
+
+define('project/Controller/Curation',[
+  'nbd/Controller',
+  'nbd/Model',
+  'project/View/Curation',
+  'lib/xhr'
+], function(Controller, Model, View, xhr) {
+  'use strict';
+
+  var constructor = Controller.extend({
+    init: function(id, queued) {
+      this.views = [];
+
+      this._model = new Model(id, {
+        blocking: false,
+        queued: queued || false
+      });
+    },
+
+    _initView: function($view) {
+      var view = new View($view, this._model);
+      view._controller = this;
+
+      return view;
+    },
+
+    add: function($view) {
+      if ($view.data('becurate')) { return this; }
+      var button = this._initView($view);
+      $view.data('becurate', button);
+      this.views.push(button);
+      return this;
+    },
+
+    queue: function() {
+      if (this._model.get('blocking')) { return; }
+
+      var model = this._model,
+          queued = this._model.get('queued'),
+          url = this.constructor.url(this._model.id()),
+          type = queued ? 'DELETE' : 'POST';
+
+      function unblock() {
+        model.set('blocking', false);
+      }
+
+      this._model.set('blocking', true);
+
+      return xhr({
+        url: url,
+        type: type
+      })
+      .then(function(response) {
+
+        if (!response) { return; }
+
+        model.set('queued', response.queued);
+      })
+      .then(unblock, unblock);
+    },
+
+    destroy: function() {
+      this.views.forEach(function(view) {
+        view.destroy();
+      });
+      this.views = [];
+
+      this._model.destroy();
+      this._model = null;
+    }
+  }, {
+    url: function(id){
+      return '/a/curation/curate/' + id;
+    }
+  });
+
+  return constructor;
+});
+
+define('project/lib/curation',['jquery',
+       'nbd/util/extend',
+       'nbd/trait/pubsub',
+       'project/Controller/Curation'
+], function($, extend, pubsub, CuratedProject) {
+  'use strict';
+
+  var create = function(id, queued) {
+    var rel = new CuratedProject(id, queued);
+    this.listenTo(rel._model, 'queued', function(queued) {
+      this.trigger('queued', id, queued);
+    });
+    return rel;
+  },
+
+  // Bind button for curating a project
+  curate = function($this, data_key) {
+    var project_id = $this.data(data_key);
+
+    if (!project_id) { return; }
+
+    create.call(api, project_id, $this.hasClass('queued')).add($this);
+  },
+
+  api = {
+    init: function($context) {
+      var self = this;
+
+      $('.js-action-curate', $context).each(function() {
+        self.curate($(this));
+      });
+    },
+
+    // Bind specific button to curate
+    curate: function($this) {
+      curate($this, 'project');
+    },
+  };
+
+  extend(api, pubsub);
+
+  return api;
+
+});
+
+define('lib/picturefill',['jquery'], function($) {
+  'use strict';
+
+  var mm = window.matchMedia || window.msMatchMedia,
+  mkimg = function() {
+    var $this = $(this), $source = $this.find('div[data-src]');
+
+    if (!$source.length) {
+      $this.find('img').remove();
+      return;
+    }
+
+    if (mm) {
+      $source = $source.first().add($source.filter(function() {
+        var m = $(this).data('media');
+        return m && mm(m).matches;
+      })).last();
+    }
+
+    // using attr here because .data() doesn't add the attribute
+    // and we want to select based on a Selectors API compliant selector
+    $this.attr('data-rendered', 'rendered');
+
+    $('<img>', {
+      alt: $this.data('alt'),
+      src: $source.data('src'),
+      'class': $source.data('class'),
+      title: $source.data('title'),
+      'data-pin-nopin': 'pin'
+    }).appendTo($this);
+  };
+
+  return ($.fn.picturefill = function() {
+    this.find('div[data-picture]:not([data-rendered])').each(mkimg);
+    return this;
+  });
+});
+
+define('project/sidebar',[
+  'jquery',
+  'nbd/util/async',
+  'nbd/util/media',
+  'be/follow',
+  'be/Controller/Dialog/Message',
+  'project/Controller/Collection',
+  'project/lib/stickyBar',
+  'project/lib/curation',
+  'lib/picturefill',
+  'lib/social',
+  'hgn!templates/project/viralIcons'
+], function($, async, media, follow, Message, Collection, stickyBar, curation, picturefill, social, viralIcons) {
+  'use strict';
+
+  return {
+    init: function($context, config,) {
+      // about project
+      var $full = $context.find('.variable-text-full'),
+        $short = $context.find('.variable-text-short'),
+        $shareContainer = $context.find('#sidebar-share'),
+        $curateContainer = $context.find('.js-sidebar-curation');
+
+      $short.on('click', '.variable-text-link', function () {
+        $short.addClass('hide');
+        $full.removeClass('hide');
+      });
+
+      $full.on('click', '.variable-text-link', function () {
+        $full.addClass('hide');
+        $short.removeClass('hide');
+      });
+
+      // In Popups, this has to fire after everything else or it breaks the context
+      if ($context.is($(document.body))) {
+        media.on('desktop:enter', function() {
+          stickyBar.init($context.find('#project-sidebar'), $context, config);
+        });
+      }
+      else {
+        async(function () {
+          stickyBar.init($context.find('#project-sidebar'), $context, config);
+        });
+      }
+
+      // featured ribbons
+      async(function() {
+        $context.find('#project-header-main').picturefill();
+      });
+
+      // follow button
+      follow.init($context);
+
+      // message button
+      this.message = new Message();
+      this.message.setContext($context.find('.js-message'));
+
+      // share buttons
+      $shareContainer.html(viralIcons({
+        url: document.location.href,
+        title: document.title,
+        no_pinterest: config.project.copyright.license === "no-use"
+      }));
+      social.init($shareContainer);
+
+      // Curation tools
+      curation.init($curateContainer);
+
+      // save to collections
+      this.collection = new Collection(config.project.id);
+      this.collection.setContext($context.find('.js-collect'));
+
+      // tags
+      var toggleShow = function (op, height) {
+            return function () {
+              $seeAll[op]('viewing-all');
+              $tags.height(height);
+            };
+          },
+          $tags = $context.find('#object-tags'),
+          $seeAll = $context.find('#object-tags-see-all');
+
+      if ($tags.length) {
+        if ($tags.prop('scrollHeight') > $tags.height()) {
+          $seeAll.find('.viewing-less-copy').on('click', toggleShow('addClass', $tags[0].scrollHeight));
+          $seeAll.find('.viewing-more-copy').on('click', toggleShow('removeClass', $tags.height()));
+
+          $seeAll.show();
+        }
+        else {
+          $tags.height('auto');
+        }
+      }
+
+      // Make this fire AFTER responsive is initialized
+      async(function() {
+        var desktop = media.is('desktop');
+
+        if (config.open_message && desktop) {
+          this.message.toggle();
+        }
+
+        if (config.open_collection && desktop) {
+          this.collection.toggle();
+        }
+      }.bind(this));
+
+    },
+
+    destroy: function() {
+      stickyBar.destroy('#project-popup');
+
+      if (this.message) {
+        this.message.destroy();
+      }
+
+      if (this.collection) {
+        this.collection.destroy();
+      }
+    }
+  };
+});
+
+define('be/stats',[
+  'jquery',
+  'nbd/util/pipe',
+  'page_constants',
+  'lib/xhr'
+], function($, pipe, constants, xhr) {
+  'use strict';
+
+  var endpointMap = {
+    project: '//' + constants.BEHANCE_API_URL + '/v2/projects',
+    user: '//' + constants.BEHANCE_API_URL + '/v2/users'
+  };
+
+  return {
+    get: function (props) {
+      return xhr({
+        type: props.httpMethod,
+        url: endpointMap[props.entity] + '/' + props.id + '/' + props.action + '?client_id=' + constants.CLIENT_ID
+      }).then(props.callback);
+    },
+
+    view: function (entity, id, callback) {
+      this.get({ httpMethod: 'POST', action: 'view', entity: entity, id: id, callback: callback });
+      return this;
+    },
+
+    appreciate: function (entity, id, callback) {
+      this.get({ httpMethod: 'POST', action: 'appreciate', entity: entity, id: id, callback: callback });
+      return this;
+    }
+  };
+});
+
+
+define("require/hgn!templates/appreciate", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div id=\"appreciated-on-content\">");t.b("\n" + i);t.b("  <div class=\"app-content app-date beicons beicons-appreciate\">Appreciated on ");t.b(t.v(t.f("date",c,p,0)));t.b("</div>");t.b("\n" + i);t.b("</div>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('project/View/Appreciation',[
+  'jquery',
+  'moment',
+  'nbd/View',
+  'be/stats',
+  'hgn!templates/appreciate'
+], function($, moment, View, stats, appreciate) {
+  "use strict";
+
+  var constructor = View.extend({
+    id : 0,
+
+    init : function(id) { this.id = id; },
+
+    render : function($container) {
+      if (!$container) { return; }
+
+      this.$view = $container;
+      this.$sticker = this.$view.find('#appreciation-sticker');
+
+      // Hide follow button on load of page if users are already being followed
+      // (still necessary?)
+      this.$view.find('.following').hide();
+
+      stats.view('project', this.id, function(result) {
+        // if project has been appreciated
+        if (result.appreciated_on > 0) { this.hide(result.appreciated_on); }
+        // If project has not been appreciated yet.
+        else { this.show(); }
+      }.bind(this));
+    },
+
+    show : function() {
+      var offset = this.$view.offset();
+
+      this.$view.find('#appreciate-it').show()
+      .on('click', function() {
+        if (offset) {
+          $('html').animate({scrollTop: offset.top - 200}, 600);
+        }
+        this.$sticker.click();
+      }.bind(this) );
+
+      this.$sticker
+      .addClass('icon-project-appreciate')
+      .one('click', this.appreciate.bind(this) );
+    },
+
+    hide : function(timestamp) {
+      this.$sticker
+      .after(appreciate({
+        date: moment.unix(timestamp).format('MMMM Do, YYYY')
+      }));
+    },
+
+    appreciate : function() {
+      stats.appreciate('project', this.id);
+
+      // Hide the appreciation sticker and show thanks sticker.
+      this.$sticker
+      .removeClass('icon-project-appreciate')
+      .addClass('icon-project-appreciate-thanks');
+
+
+      this.$view.find('#appreciate-it').hide();
+
+      // Increment the number in project info
+      $('#appreNum').text(+$('#appreNum').text() + 1);
+
+    }
+  });
+
+  return constructor;
+});
+
+ /*!
+ * fancyBox - jQuery Plugin
+ * version: 2.0.4 (12/12/2011)
+ * @requires jQuery v1.6 or later
+ *
+ * Examples at http://fancyapps.com/fancybox/
+ * License: www.fancyapps.com/fancybox/#license
+ *
+ * Copyright 2011 Janis Skarnelis - janis@fancyapps.com
+ *
+ */
+(function (window, document, $) {
+	var W = $(window),
+		D = $(document),
+		F = $.fancybox = function () {
+			F.open.apply( this, arguments );
+		},
+		didResize = false,
+    msie = navigator.userAgent.match(/msie/i),
+		resizeTimer = null;
+
+	$.extend(F, {
+		// The current version of fancyBox
+		version: '2.0.4',
+
+		defaults: {
+			padding: 15,
+			margin: 20,
+
+			width: 800,
+			height: 600,
+			minWidth: 200,
+			minHeight: 200,
+			maxWidth: 9999,
+			maxHeight: 9999,
+
+			autoSize: true,
+			fitToView: true,
+			aspectRatio: false,
+			topRatio: 0.5,
+
+			fixed: !'ontouchstart' in document.documentElement || document,
+			scrolling: 'auto', // 'auto', 'yes' or 'no'
+			wrapCSS: 'fancybox-default',
+
+			arrows: true,
+			closeBtn: true,
+			closeClick: false,
+			nextClick : false,
+			mouseWheel: true,
+			autoPlay: false,
+			playSpeed: 3000,
+
+			modal: false,
+			loop: true,
+			ajax: {},
+			keys: {
+				next: [13, 32, 34, 39, 40], // enter, space, page down, right arrow, down arrow
+				prev: [8, 33, 37, 38], // backspace, page up, left arrow, up arrow
+				close: [27] // escape key
+			},
+
+			// Override some properties
+			index: 0,
+			type: null,
+			href: null,
+			content: null,
+			title: null,
+
+			// HTML templates
+			tpl: {
+				wrap: '<div class="fancybox-wrap"><div class="fancybox-outer"><div class="fancybox-inner"></div></div></div>',
+				image: '<img class="fancybox-image" src="{href}" alt="" />',
+				iframe: '<iframe class="fancybox-iframe" name="fancybox-frame{rnd}" frameborder="0" hspace="0" ' + (msie ? 'allowtransparency="true""' : '') + ' scrolling="{scrolling}" src="{href}"></iframe>',
+				swf: '<object classid="clsid:D27CDB6E-AE6D-11cf-96B8-444553540000" width="100%" height="100%"><param name="wmode" value="transparent" /><param name="allowfullscreen" value="true" /><param name="allowscriptaccess" value="always" /><param name="movie" value="{href}" /><embed src="{href}" type="application/x-shockwave-flash" allowfullscreen="true" allowscriptaccess="always" width="100%" height="100%" wmode="transparent"></embed></object>',
+				error: '<p class="fancybox-error">The requested content cannot be loaded.<br/>Please try again later.</p>',
+				closeBtn: '<div title="Close" class="fancybox-item fancybox-close"></div>',
+				next: '<a title="Next" class="fancybox-item fancybox-next"><span></span></a>',
+				prev: '<a title="Previous" class="fancybox-item fancybox-prev"><span></span></a>'
+			},
+
+			// Properties for each animation type
+			// Opening fancyBox
+			openEffect: 'fade', // 'elastic', 'fade' or 'none'
+			openSpeed: 250,
+			openEasing: 'swing',
+			openOpacity: true,
+			openMethod: 'zoomIn',
+
+			// Closing fancyBox
+			closeEffect: 'fade', // 'elastic', 'fade' or 'none'
+			closeSpeed: 250,
+			closeEasing: 'swing',
+			closeOpacity: true,
+			closeMethod: 'zoomOut',
+
+			// Changing next gallery item
+			nextEffect: 'elastic', // 'elastic', 'fade' or 'none'
+			nextSpeed: 300,
+			nextEasing: 'swing',
+			nextMethod: 'changeIn',
+
+			// Changing previous gallery item
+			prevEffect: 'elastic', // 'elastic', 'fade' or 'none'
+			prevSpeed: 300,
+			prevEasing: 'swing',
+			prevMethod: 'changeOut',
+
+			// Enabled helpers
+			helpers: {
+				overlay: {
+					speedIn: 0,
+					speedOut: 300,
+					opacity: 0.8,
+					css: {
+						cursor: 'pointer'
+					},
+					closeClick: true
+				},
+				title: {
+					type: 'float' // 'float', 'inside', 'outside' or 'over'
+				}
+			},
+
+			// Callbacks
+			onCancel: $.noop, // If canceling
+			beforeLoad: $.noop, // Before loading
+			afterLoad: $.noop, // After loading
+			beforeShow: $.noop, // Before changing in current item
+			afterShow: $.noop, // After opening
+			beforeClose: $.noop, // Before closing
+			afterClose: $.noop // After closing
+		},
+
+		//Current state
+		group: {}, // Selected group
+		opts: {}, // Group options
+		coming: null, // Element being loaded
+		current: null, // Currently loaded element
+		isOpen: false, // Is currently open
+		isOpened: false, // Have been fully opened at least once
+		wrap: null,
+		outer: null,
+		inner: null,
+
+		player: {
+			timer: null,
+			isActive: false
+		},
+
+		// Loaders
+		ajaxLoad: null,
+		imgPreload: null,
+
+		// Some collections
+		transitions: {},
+		helpers: {},
+
+		/*
+		 *	Static methods
+		 */
+
+		open: function (group, opts) {
+			// Normalize group
+			if (!$.isArray(group)) {
+				group = [group];
+			}
+
+			if (!group.length) {
+				return;
+			}
+
+			//Kill existing instances
+			F.close(true);
+
+			//Extend the defaults
+			F.opts = $.extend(true, {}, F.defaults, opts);
+			F.group = group;
+
+			F._start(F.opts.index || 0);
+		},
+
+		cancel: function () {
+			if (F.coming && false === F.trigger('onCancel')) {
+				return;
+			}
+
+			F.coming = null;
+
+			F.hideLoading();
+
+			if (F.ajaxLoad) {
+				F.ajaxLoad.abort();
+			}
+
+			F.ajaxLoad = null;
+
+			if (F.imgPreload) {
+				F.imgPreload.onload = F.imgPreload.onabort = F.imgPreload.onerror = null;
+			}
+		},
+
+		close: function (a) {
+			F.cancel();
+
+			if (!F.current || false === F.trigger('beforeClose')) {
+				return;
+			}
+
+			F.unbindEvents();
+
+			//If forced or is still opening then remove immediately
+			if (!F.isOpen || (a && a[0] === true)) {
+				$(".fancybox-wrap").stop().trigger('onReset').remove();
+
+				F._afterZoomOut();
+
+			} else {
+				F.isOpen = F.isOpened = false;
+
+				$(".fancybox-item").remove();
+
+				F.wrap.stop(true).removeClass('fancybox-opened');
+				F.inner.css('overflow', 'hidden');
+
+				F.transitions[F.current.closeMethod]();
+			}
+		},
+
+		// Start/stop slideshow
+		play: function (a) {
+			var clear = function () {
+					clearTimeout(F.player.timer);
+				},
+				set = function () {
+					clear();
+
+					if (F.current && F.player.isActive) {
+						F.player.timer = setTimeout(F.next, F.current.playSpeed);
+					}
+				},
+				stop = function () {
+					clear();
+
+					$('body').unbind('.player');
+
+					F.player.isActive = false;
+
+					F.trigger('onPlayEnd');
+				},
+				start = function () {
+					if (F.current && (F.current.loop || F.current.index < F.group.length - 1)) {
+						F.player.isActive = true;
+
+						$('body').bind({
+							'afterShow.player onUpdate.player': set,
+							'onCancel.player beforeClose.player': stop,
+							'beforeLoad.player': clear
+						});
+
+						set();
+
+						F.trigger('onPlayStart');
+					}
+				};
+
+			if (F.player.isActive || (a && a[0] === false)) {
+				stop();
+			} else {
+				start();
+			}
+		},
+
+		next: function () {
+			if (F.current) {
+				F.jumpto(F.current.index + 1);
+			}
+		},
+
+		prev: function () {
+			if (F.current) {
+				F.jumpto(F.current.index - 1);
+			}
+		},
+
+		jumpto: function (index) {
+			if (!F.current) {
+				return;
+			}
+
+			index = parseInt(index, 10);
+
+			if (F.group.length > 1 && F.current.loop) {
+				if (index >= F.group.length) {
+					index = 0;
+
+				} else if (index < 0) {
+					index = F.group.length - 1;
+				}
+			}
+
+			if (typeof F.group[index] !== 'undefined') {
+				F.cancel();
+
+				F._start(index);
+			}
+		},
+
+		reposition: function (a) {
+			if (F.isOpen) {
+				F.wrap.css(F._getPosition(a));
+			}
+		},
+
+		update: function () {
+			if (F.isOpen) {
+				// It's a very bad idea to attach handlers to the window scroll event, run this code after a delay
+				if (!didResize) {
+					resizeTimer = setInterval(function () {
+						if (didResize) {
+							didResize = false;
+
+							clearTimeout(resizeTimer);
+
+							if (F.current) {
+								if (F.current.autoSize) {
+									F.inner.height('auto');
+									F.current.height = F.inner.height();
+								}
+
+								F._setDimension();
+
+								if (F.current.canGrow) {
+									F.inner.height('auto');
+								}
+
+								F.reposition();
+
+								F.trigger('onUpdate');
+							}
+						}
+					}, 100);
+				}
+
+				didResize = true;
+			}
+		},
+
+		toggle: function () {
+			if (F.isOpen) {
+				F.current.fitToView = !F.current.fitToView;
+
+				F.update();
+			}
+		},
+
+		hideLoading: function () {
+			$("#fancybox-loading").remove();
+		},
+
+		showLoading: function () {
+			F.hideLoading();
+
+			$('<div id="fancybox-loading"></div>').click(F.cancel).appendTo('body');
+		},
+
+		getViewport: function () {
+			return {
+				x: W.scrollLeft(),
+				y: W.scrollTop(),
+				w: W.width(),
+				h: W.height()
+			};
+		},
+
+		// Unbind the keyboard / clicking actions
+		unbindEvents: function () {
+			if (F.wrap) {
+				F.wrap.unbind('.fb');	
+			}
+
+			D.unbind('.fb');
+			W.unbind('.fb');
+		},
+
+		bindEvents: function () {
+			var current = F.current,
+				keys = current.keys;
+
+			if (!current) {
+				return;
+			}
+
+			W.bind('resize.fb, orientationchange.fb', F.update);
+
+			if (keys) {
+				D.bind('keydown.fb', function (e) {
+					var code;
+
+					// Ignore key combinations and key events within form elements
+					if (!e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey && $.inArray(e.target.tagName.toLowerCase(), ['input', 'textarea', 'select', 'button']) < 0) {
+						code = e.keyCode;
+
+						if ($.inArray(code, keys.close) > -1) {
+							F.close();
+							e.preventDefault();
+
+						} else if ($.inArray(code, keys.next) > -1) {
+							F.next();
+							e.preventDefault();
+
+						} else if ($.inArray(code, keys.prev) > -1) {
+							F.prev();
+							e.preventDefault();
+						}
+					}
+				});
+			}
+
+			if ($.fn.mousewheel && current.mouseWheel && F.group.length > 1) {
+				F.wrap.bind('mousewheel.fb', function (e, delta) {
+					var target = $(e.target).get(0);
+
+					if (target.clientHeight === 0 || target.scrollHeight === target.clientHeight) {
+						e.preventDefault();
+
+						F[delta > 0 ? 'prev' : 'next']();
+					}
+				});
+			}
+		},
+
+		trigger: function (event) {
+			var ret, obj = F[ $.inArray(event, ['onCancel', 'beforeLoad', 'afterLoad']) > -1 ? 'coming' : 'current' ];
+
+			if (!obj) {
+				return;
+			}
+
+			if ($.isFunction( obj[event] )) {
+				ret = obj[event].apply(obj, Array.prototype.slice.call(arguments, 1));
+			}
+
+			if (ret === false) {
+				return false;
+			}
+
+			if (obj.helpers) {
+				$.each(obj.helpers, function (helper, opts) {
+					if (opts && typeof F.helpers[helper] !== 'undefined' && $.isFunction(F.helpers[helper][event])) {
+						F.helpers[helper][event](opts, obj);
+					}
+				});
+			}
+
+			$.event.trigger(event + '.fb');
+		},
+
+		isImage: function (str) {
+			return str && str.match(/\.(jpg|gif|png|bmp|jpeg)(.*)?$/i);
+		},
+
+		isSWF: function (str) {
+			return str && str.match(/\.(swf)(.*)?$/i);
+		},
+
+		_start: function (index) {
+			var coming = {},
+				element = F.group[index] || null,
+				isDom,
+				href,
+				type,
+				rez;
+
+			if (typeof element === 'object' && (element.nodeType || element instanceof $)) {
+				isDom = true;
+
+				if ($.metadata) {
+					coming = $(element).metadata();
+				}
+			}
+
+			coming = $.extend(true, {}, F.opts, {index : index, element : element}, ($.isPlainObject(element) ? element : coming));
+
+			// Re-check overridable options
+			$.each(['href', 'title', 'content', 'type'], function(i,v) {
+				coming[v] = F.opts[ v ] || (isDom && $(element).attr( v )) || coming[ v ] || null;
+			});
+
+			// Convert margin property to array - top, right, bottom, left
+			if (typeof coming.margin === 'number') {
+				coming.margin = [coming.margin, coming.margin, coming.margin, coming.margin];
+			}
+
+			// 'modal' propery is just a shortcut
+			if (coming.modal) {
+				$.extend(true, coming, {
+					closeBtn : false,
+					closeClick: false,
+					nextClick : false,
+					arrows : false,
+					mouseWheel : false,
+					keys : null,
+					helpers: {
+						overlay : {
+							css: {
+								cursor : 'auto'
+							},
+							closeClick : false
+						}
+					}
+				});
+			}
+
+			//Give a chance for callback or helpers to update coming item (type, title, etc)
+			F.coming = coming;
+
+			if (false === F.trigger('beforeLoad')) {
+				F.coming = null;
+				return;
+			}
+
+			type = coming.type;
+			href = coming.href;
+
+			///Check if content type is set, if not, try to get
+			if (!type) {
+				if (isDom) {
+					rez = $(element).data('fancybox-type');
+
+					if (!rez && element.className) {
+						rez = element.className.match(/fancybox\.(\w+)/);
+						type = rez ? rez[1] : null;
+					}
+				}
+
+				if (!type && href) {
+					if (F.isImage(href)) {
+						type = 'image';
+
+					} else if (F.isSWF(href)) {
+						type = 'swf';
+
+					} else if (href.match(/^#/)) {
+						type = 'inline';
+					}
+				}
+
+				// ...if not - display element itself
+				if (!type) {
+					type = isDom ? 'inline' : 'html';
+				}
+
+				coming.type = type;
+			}
+
+			// Check before try to load; 'inline' and 'html' types need content, others - href
+			if (type === 'inline' || type === 'html') {
+				coming.content = coming.content || (type === 'inline' && href ? $(href) : element);
+
+				if (!coming.content.length) {
+					type = null;
+				}
+
+			} else {
+				coming.href = href || element;
+
+				if (!coming.href) {
+					type = null;
+				}
+			}
+
+			/*
+				Add reference to the group, so it`s possible to access from callbacks, example:
+
+				afterLoad : function() {
+					this.title = 'Image ' + (this.index + 1) + ' of ' + this.group.length + (this.title ? ' - ' + this.title : '');
+				}
+
+			*/
+
+			coming.group = F.group;
+
+			if (type === 'image') {
+				F._loadImage();
+
+			} else if (type === 'ajax') {
+				F._loadAjax();
+
+			} else if (type) {
+				F._afterLoad();
+
+			} else {
+				F._error( 'type' );
+			}
+		},
+
+		_error: function ( type ) {
+			$.extend(F.coming, {
+				type : 'html',
+				autoSize : true,
+				minHeight : '0',
+				hasError : type,
+				content : F.coming.tpl.error
+			});
+
+			F._afterLoad();
+		},
+
+		_loadImage: function () {
+			// Reset preload image so it is later possible to check "complete" property
+			F.imgPreload = new Image();
+
+			F.imgPreload.onload = function () {
+				this.onload = this.onerror = null;
+
+				F.coming.width = this.width;
+				F.coming.height = this.height;
+
+				F._afterLoad();
+			};
+
+			F.imgPreload.onerror = function () {
+				this.onload = this.onerror = null;
+
+				F._error( 'image' );
+			};
+
+			F.imgPreload.src = F.coming.href;
+
+			if (!F.imgPreload.complete) {
+				F.showLoading();
+			}
+		},
+
+		_loadAjax: function () {
+			F.showLoading();
+
+			F.ajaxLoad = $.ajax($.extend({}, F.coming.ajax, {
+				url: F.coming.href,
+				error: function (jqXHR, textStatus) {
+					if (textStatus !== 'abort') {
+						F._error( 'ajax', jqXHR );
+
+					} else {
+						F.hideLoading();
+					}
+				},
+				success: function (data, textStatus) {
+					if (textStatus === 'success') {
+						F.coming.content = data;
+
+						F._afterLoad();
+					}
+				}
+			}));
+		},
+
+		_preload : function() {
+			var group = F.group,
+				index = F.current.index,
+				load = function(href) {
+					if (href && F.isImage(href)) {
+						new Image().src = href;
+					}
+				};
+
+			if (group.length > 1) {
+				load( $( group[ index + 1 ] || group[ 0 ] ).attr('href') );
+				load( $( group[ index - 1 ] || group[ group.length - 1 ] ).attr('href') );
+			}
+		},
+
+		_afterLoad: function () {
+			F.hideLoading();
+
+			if (!F.coming || false === F.trigger('afterLoad', F.current)) {
+				F.coming = false;
+
+				return;
+			}
+
+			if (F.isOpened) {
+				$(".fancybox-item").remove();
+
+				F.wrap.stop(true).removeClass('fancybox-opened');
+				F.inner.css('overflow', 'hidden');
+
+				F.transitions[F.current.prevMethod]();
+
+			} else {
+				$(".fancybox-wrap").stop().trigger('onReset').remove();
+
+				F.trigger('afterClose');
+			}
+
+			F.unbindEvents();
+
+			F.isOpen = false;
+			F.current = F.coming;
+			F.coming = false;
+
+			//Build the neccessary markup
+			F.wrap = $(F.current.tpl.wrap).addClass('fancybox-tmp ' + F.current.wrapCSS).appendTo('body');
+			F.outer = $('.fancybox-outer', F.wrap).css('padding', F.current.padding + 'px');
+			F.inner = $('.fancybox-inner', F.wrap);
+
+			F._setContent();
+
+			//Give a chance for helpers or callbacks to update elements
+			F.trigger('beforeShow');
+
+			//Set initial dimensions and hide
+			F._setDimension();
+
+			F.wrap.hide().removeClass('fancybox-tmp');
+
+			F.bindEvents();
+			F._preload();
+
+			F.transitions[ F.isOpened ? F.current.nextMethod : F.current.openMethod ]();
+		},
+
+		_setContent: function () {
+			var content, loadingBay, current = F.current,
+				type = current.type;
+
+			switch (type) {
+				case 'inline':
+				case 'ajax':
+				case 'html':
+					content = current.content;
+
+					if (type === 'inline' && content instanceof $) {
+						content = content.show().detach();
+
+						if (content.parent().hasClass('fancybox-inner')) {
+							content.parents('.fancybox-wrap').trigger('onReset').remove();
+						}
+
+						$(F.wrap).bind('onReset', function () {
+							content.appendTo('body').hide();
+						});
+					}
+
+					if (current.autoSize) {
+						loadingBay = $('<div class="fancybox-tmp"></div>').appendTo($("body")).append(content);
+
+						current.width = loadingBay.outerWidth();
+						current.height = loadingBay.outerHeight(true);
+
+						content = loadingBay.contents().detach();
+
+						loadingBay.remove();
+					}
+
+				break;
+
+				case 'image':
+					content = current.tpl.image.replace('{href}', current.href);
+
+					current.aspectRatio = true;
+				break;
+
+				case 'swf':
+					content = current.tpl.swf.replace(/\{width\}/g, current.width).replace(/\{height\}/g, current.height).replace(/\{href\}/g, current.href);
+				break;
+
+				case 'iframe':
+					content = current.tpl.iframe.replace('{href}', current.href).replace('{scrolling}', current.scrolling).replace('{rnd}', new Date().getTime());
+				break;
+			}
+
+			if ($.inArray(type, ['image', 'swf', 'iframe']) > -1) {
+				current.autoSize = false;
+				current.scrolling = false;
+			}
+
+			F.inner.append(content);
+		},
+
+		_setDimension: function () {
+			var wrap = F.wrap,
+				outer = F.outer,
+				inner = F.inner,
+				current = F.current,
+				viewport = F.getViewport(),
+				margin = current.margin,
+				padding2 = current.padding * 2,
+				width = current.width + padding2,
+				height = current.height + padding2,
+				ratio = current.width / current.height,
+
+				maxWidth = current.maxWidth,
+				maxHeight = current.maxHeight,
+				minWidth = current.minWidth,
+				minHeight = current.minHeight,
+				height_,
+				space;
+
+			viewport.w -= (margin[1] + margin[3]);
+			viewport.h -= (margin[0] + margin[2]);
+
+			if (width.toString().indexOf('%') > -1) {
+				width = ((viewport.w * parseFloat(width)) / 100);
+			}
+
+			if (height.toString().indexOf('%') > -1) {
+				height = ((viewport.h * parseFloat(height)) / 100);
+			}
+
+			if (current.fitToView) {
+				maxWidth = Math.min(viewport.w, maxWidth);
+				maxHeight = Math.min(viewport.h, maxHeight);
+			}
+
+			minWidth = Math.min(width, minWidth);
+			minHeight = Math.min(width, minHeight);
+
+			maxWidth = Math.max(minWidth, maxWidth);
+			maxHeight = Math.max(minHeight, maxHeight);
+
+			if (current.aspectRatio) {
+				if (width > maxWidth) {
+					width = maxWidth;
+					height = ((width - padding2) / ratio) + padding2;
+				}
+
+				if (height > maxHeight) {
+					height = maxHeight;
+					width = ((height - padding2) * ratio) + padding2;
+				}
+
+				if (width < minWidth) {
+					width = minWidth;
+					height = ((width - padding2) / ratio) + padding2;
+				}
+
+				if (height < minHeight) {
+					height = minHeight;
+					width = ((height - padding2) * ratio) + padding2;
+				}
+
+			} else {
+				width = Math.max(minWidth, Math.min(width, maxWidth));
+				height = Math.max(minHeight, Math.min(height, maxHeight));
+			}
+
+			width = Math.round(width);
+			height = Math.round(height);
+
+			//Reset dimensions
+			$(wrap.add(outer).add(inner)).width('auto').height('auto');
+
+			inner.width(width - padding2).height(height - padding2);
+			wrap.width(width);
+
+			height_ = wrap.height(); // Real wrap height
+
+			//Fit wrapper inside
+			if (width > maxWidth || height_ > maxHeight) {
+				while ((width > maxWidth || height_ > maxHeight) && width > minWidth && height_ > minHeight) {
+					height = height - 10;
+
+					if (current.aspectRatio) {
+						width = Math.round(((height - padding2) * ratio) + padding2);
+
+						if (width < minWidth) {
+							width = minWidth;
+							height = ((width - padding2) / ratio) + padding2;
+						}
+
+					} else {
+						width = width - 10;
+					}
+
+					inner.width(width - padding2).height(height - padding2);
+					wrap.width(width);
+
+					height_ = wrap.height();
+				}
+			}
+
+			current.dim = {
+				width: width,
+				height: height_
+			};
+
+			current.canGrow = current.autoSize && height > minHeight && height < maxHeight;
+			current.canShrink = false;
+			current.canExpand = false;
+
+			if ((width - padding2) < current.width || (height - padding2) < current.height) {
+				current.canExpand = true;
+
+			} else if ((width > viewport.w || height_ > viewport.h) && width > minWidth && height > minHeight) {
+				current.canShrink = true;
+			}
+
+			space = height_ - padding2;
+
+			F.innerSpace = space - inner.height();
+			F.outerSpace = space - outer.height();
+		},
+
+		_getPosition: function (a) {
+			var current = F.current,
+				viewport = F.getViewport(),
+				margin = current.margin,
+				width = F.wrap.width() + margin[1] + margin[3],
+				height = F.wrap.height() + margin[0] + margin[2],
+				rez = {
+					position: 'absolute',
+					top: margin[0] + viewport.y,
+					left: margin[3] + viewport.x
+				};
+
+			if (current.fixed && (!a || a[0] === false) && height <= viewport.h && width <= viewport.w) {
+				rez = {
+					position: 'fixed',
+					top: margin[0],
+					left: margin[3]
+				};
+			}
+
+			rez.top = Math.ceil(Math.max(rez.top, rez.top + ((viewport.h - height) * current.topRatio))) + 'px';
+			rez.left = Math.ceil(Math.max(rez.left, rez.left + ((viewport.w - width) * 0.5))) + 'px';
+
+			return rez;
+		},
+
+		_afterZoomIn: function () {
+			var current = F.current;
+
+			F.isOpen = F.isOpened = true;
+
+			F.wrap.addClass('fancybox-opened').css('overflow', 'visible');
+
+			F.update();
+
+			F.inner.css('overflow', current.scrolling === 'auto' ? 'auto' : (current.scrolling === 'yes' ? 'scroll' : 'hidden'));
+
+			//Assign a click event
+			if (current.closeClick || current.nextClick) {
+				F.inner.css('cursor', 'pointer').bind('click.fb', current.nextClick ? F.next : F.close);
+			}
+
+			//Create a close button
+			if (current.closeBtn) {
+				$(current.tpl.closeBtn).appendTo(F.wrap).bind('click.fb', F.close);
+			}
+
+			//Create navigation arrows
+			if (current.arrows && F.group.length > 1) {
+				if (current.loop || current.index > 0) {
+					$(current.tpl.prev).appendTo(F.wrap).bind('click.fb', F.prev);
+				}
+
+				if (current.loop || current.index < F.group.length - 1) {
+					$(current.tpl.next).appendTo(F.wrap).bind('click.fb', F.next);
+				}
+			}
+
+			F.trigger('afterShow');
+
+			if (F.opts.autoPlay && !F.player.isActive) {
+				F.opts.autoPlay = false;
+
+				F.play();
+			}
+		},
+
+		_afterZoomOut: function () {
+			F.trigger('afterClose');
+
+			F.wrap.trigger('onReset').remove();
+
+			$.extend(F, {
+				group: {},
+				opts: {},
+				current: null,
+				isOpened: false,
+				isOpen: false,
+				wrap: null,
+				outer: null,
+				inner: null
+			});
+		}
+	});
+
+	/*
+	 *	Default transitions
+	 */
+
+	F.transitions = {
+		getOrigPosition: function () {
+			var element = F.current.element,
+				pos = {},
+				width = 50,
+				height = 50,
+				image, viewport;
+
+			if (element && element.nodeName && $(element).is(':visible')) {
+				image = $(element).find('img:first');
+
+				if (image.length) {
+					pos = image.offset();
+					width = image.outerWidth();
+					height = image.outerHeight();
+
+				} else {
+					pos = $(element).offset();
+				}
+
+			} else {
+				viewport = F.getViewport();
+				pos.top = viewport.y + (viewport.h - height) * 0.5;
+				pos.left = viewport.x + (viewport.w - width) * 0.5;
+			}
+
+			pos = {
+				top: Math.ceil(pos.top) + 'px',
+				left: Math.ceil(pos.left) + 'px',
+				width: Math.ceil(width) + 'px',
+				height: Math.ceil(height) + 'px'
+			};
+
+			return pos;
+		},
+
+		step: function (now, fx) {
+			var ratio, innerValue, outerValue;
+
+			if (fx.prop === 'width' || fx.prop === 'height') {
+				innerValue = outerValue = Math.ceil(now - (F.current.padding * 2));
+
+				if (fx.prop === 'height') {
+					ratio = (now - fx.start) / (fx.end - fx.start);
+
+					if (fx.start > fx.end) {
+						ratio = 1 - ratio;
+					}
+
+					innerValue -= F.innerSpace * ratio;
+					outerValue -= F.outerSpace * ratio;
+				}
+
+				F.inner[fx.prop](innerValue);
+				F.outer[fx.prop](outerValue);
+			}
+		},
+
+		zoomIn: function () {
+			var wrap = F.wrap,
+				current = F.current,
+				startPos,
+				endPos,
+				dim = current.dim;
+
+			if (current.openEffect === 'elastic') {
+				endPos = $.extend({}, dim, F._getPosition(true));
+
+				//Remove "position" property
+				delete endPos.position;
+
+				startPos = this.getOrigPosition();
+
+				if (current.openOpacity) {
+					startPos.opacity = 0;
+					endPos.opacity = 1;
+				}
+
+				wrap.css(startPos).show().animate(endPos, {
+					duration: current.openSpeed,
+					easing: current.openEasing,
+					step: this.step,
+					complete: F._afterZoomIn
+				});
+
+			} else {
+				wrap.css($.extend({}, dim, F._getPosition()));
+
+				if (current.openEffect === 'fade') {
+					wrap.fadeIn(current.openSpeed, F._afterZoomIn);
+
+				} else {
+					wrap.show();
+					F._afterZoomIn();
+				}
+			}
+		},
+
+		zoomOut: function () {
+			var wrap = F.wrap,
+				current = F.current,
+				endPos;
+
+			if (current.closeEffect === 'elastic') {
+				if (wrap.css('position') === 'fixed') {
+					wrap.css(F._getPosition(true));
+				}
+
+				endPos = this.getOrigPosition();
+
+				if (current.closeOpacity) {
+					endPos.opacity = 0;
+				}
+
+				wrap.animate(endPos, {
+					duration: current.closeSpeed,
+					easing: current.closeEasing,
+					step: this.step,
+					complete: F._afterZoomOut
+				});
+
+			} else {
+				wrap.fadeOut(current.closeEffect === 'fade' ? current.closeSpeed : 0, F._afterZoomOut);
+			}
+		},
+
+		changeIn: function () {
+			var wrap = F.wrap,
+				current = F.current,
+				startPos;
+
+			if (current.nextEffect === 'elastic') {
+				startPos = F._getPosition(true);
+				startPos.opacity = 0;
+				startPos.top = (parseInt(startPos.top, 10) - 200) + 'px';
+
+				wrap.css(startPos).show().animate({
+					opacity: 1,
+					top: '+=200px'
+				}, {
+					duration: current.nextSpeed,
+					complete: F._afterZoomIn
+				});
+
+			} else {
+				wrap.css(F._getPosition());
+
+				if (current.nextEffect === 'fade') {
+					wrap.hide().fadeIn(current.nextSpeed, F._afterZoomIn);
+
+				} else {
+					wrap.show();
+					F._afterZoomIn();
+				}
+			}
+		},
+
+		changeOut: function () {
+			var wrap = F.wrap,
+				current = F.current,
+				cleanUp = function () {
+					$(this).trigger('onReset').remove();
+				};
+
+			wrap.removeClass('fancybox-opened');
+
+			if (current.prevEffect === 'elastic') {
+				wrap.animate({
+					'opacity': 0,
+					top: '+=200px'
+				}, {
+					duration: current.prevSpeed,
+					complete: cleanUp
+				});
+
+			} else {
+				wrap.fadeOut(current.prevEffect === 'fade' ? current.prevSpeed : 0, cleanUp);
+			}
+		}
+	};
+
+	/*
+	 *	Overlay helper
+	 */
+
+	F.helpers.overlay = {
+		overlay: null,
+
+		update: function () {
+			var width, scrollWidth, offsetWidth;
+
+			//Reset width/height so it will not mess
+			this.overlay.width(0).height(0);
+
+			if (msie) {
+				scrollWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
+				offsetWidth = Math.max(document.documentElement.offsetWidth, document.body.offsetWidth);
+
+				width = scrollWidth < offsetWidth ? W.width() : scrollWidth;
+
+			} else {
+				width = D.width();
+			}
+
+			this.overlay.width(width).height(D.height());
+		},
+
+		beforeShow: function (opts) {
+			if (this.overlay) {
+				return;
+			}
+
+			this.overlay = $('<div id="fancybox-overlay"></div>').css(opts.css || {
+				background: 'black'
+			}).appendTo('body');
+
+			this.update();
+
+			if (opts.closeClick) {
+				this.overlay.bind('click.fb', F.close);
+			}
+
+			W.bind("resize.fb", $.proxy(this.update, this));
+
+			this.overlay.fadeTo(opts.speedIn || "fast", opts.opacity || 1);
+		},
+
+		onUpdate: function () {
+			//Update as content may change document dimensions
+			this.update();
+		},
+
+		afterClose: function (opts) {
+			if (this.overlay) {
+				this.overlay.fadeOut(opts.speedOut || "fast", function () {
+					$(this).remove();
+				});
+			}
+
+			this.overlay = null;
+		}
+	};
+
+	/*
+	 *	Title helper
+	 */
+
+	F.helpers.title = {
+		beforeShow: function (opts) {
+			var title, text = F.current.title;
+
+			if (text) {
+				title = $('<div class="fancybox-title fancybox-title-' + opts.type + '-wrap">' + text + '</div>').appendTo('body');
+
+				if (opts.type === 'float') {
+					//This helps for some browsers
+					title.width(title.width());
+
+					title.wrapInner('<span class="child"></span>');
+
+					//Increase bottom margin so this title will also fit into viewport
+					F.current.margin[2] += Math.abs(parseInt(title.css('margin-bottom'), 10));
+				}
+
+				title.appendTo(opts.type === 'over' ? F.inner : (opts.type === 'outside' ? F.wrap : F.outer));
+			}
+		}
+	};
+
+	// jQuery plugin initialization
+	$.fn.fancybox = function (options) {
+		var opts = options || {},
+			selector = this.selector || '';
+
+		function run(e) {
+			var group = [], relType, relVal, rel = this.rel;
+
+			if (!(e.ctrlKey || e.altKey || e.shiftKey || e.metaKey)) {
+				e.preventDefault();
+
+				relVal = $(this).data('fancybox-group');
+
+				// Check if element has 'data-fancybox-group' attribute, if not - use 'rel'
+				if (typeof relVal !== 'undefined') {
+					relType = relVal ? 'data-fancybox-group' : false;
+
+				} else if (rel && rel !== '' && rel !== 'nofollow') {
+					relVal = rel;
+					relType = 'rel';
+				}
+
+				if (relType) {
+					group = selector.length ? $(selector).filter('[' + relType + '="' + relVal + '"]') : $('[' + relType + '="' + relVal + '"]');
+				}
+
+				if (group.length) {
+					opts.index = group.index(this);
+
+					F.open(group.get(), opts);
+
+				} else {
+					F.open(this, opts);
+				}
+			}
+		}
+
+		if (selector) {
+			D.undelegate(selector, 'click.fb-start').delegate(selector, 'click.fb-start', run);
+
+		} else {
+			$(this).unbind('click.fb-start').bind('click.fb-start', run);
+		}
+
+		return this;
+	};
+
+}(window, document, jQuery));
+define("jquery/plugins/jquery.fancybox", function(){});
+
+define('project/lib/highdef',['jquery', 'jquery/plugins/jquery.fancybox'], function($) {
+  'use strict';
+
+  var fancyOption = {
+      padding: 0,
+      loop: true,
+      nextEffect: 'fade',
+      prevEffect: 'fade',
+      title: '',
+      helpers: {
+        title: {
+          type: 'outside'
+        }
+      },
+      tpl: {
+        closeBtn: '<div title="Close" class="fancybox-item close right popup-close popup-icon-close beicons beicons-x"></div>'
+      }
+    },
+
+  // Prepend image filenames with hd_
+    source = function() {
+      var $this = $(this),
+        hdSrc = $this.data('hd-src'),
+      // Accounting for lazyloaded images
+        src = $this.attr('original') || $this.attr('src'),
+        i;
+
+      if (hdSrc) { return hdSrc; }
+
+      if (~(i = src.lastIndexOf('/'))) {
+        return src.substring(0, i + 1) + 'hd_' + src.substring(i + 1);
+      }
+
+      return src;
+    },
+
+  // Setup fancybox
+    fancy = function() {
+      $(this)
+        .attr('data-fancybox-group', 'gallery')
+        .attr('href', source.call(this))
+        .fancybox(fancyOption);
+    };
+
+  return ($.fn.highdef = function() {
+    this.each(fancy);
+
+    // Zoom cursor
+    ['-moz-zoom-in', '-webkit-zoom-in', 'zoom-in',
+     'url("/assets/img/site/-ie-zoom-in.cur"), pointer, hand'
+    ].forEach(function(cursor) {
+        this.css('cursor', cursor);
+      }, this);
+
+    return this;
+  });
+});
+
+
+define("require/hgn!templates/html", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b(t.t(t.f("html",c,p,0)));t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('project/trait/mature',['nbd/util/extend',
+       'hgn!templates/html',
+       'vendor/history'
+], function(extend, html, History) {
+  'use strict';
+
+  var buttons = {
+    "restricted-safe" : [{
+      label : "Turn off Safe Browsing",
+      classes: ['form-button-default', 'form-submit']
+    }, {
+      label: "Cancel",
+      classes: ['form-button-cancel']
+    }]
+  };
+
+  return {
+    mustache : html,
+
+    templateData : function() {
+      var data = extend({
+        classes: ['mature-blocker', 'safe']
+      }, this._model.data());
+
+      data.buttons = buttons[ data.access ];
+      return data;
+    },
+
+    rendered : function() {
+
+      this.$view
+      .on('click', '.form-submit', function() {
+        this.Controller.disableSafeBrowsing()
+        .then(this.hide.bind(this))
+        .then(this.destroy.bind(this));
+      }.bind(this))
+      .filter('.blocking-div')
+        .on('click', function(e) {
+          e.stopImmediatePropagation();
+        });
+
+      this._super();
+    }
+  };
+
+});
+
+define('project/Controller/MatureContent',[
+  'lib/xhr',
+  'be/Controller/Dialog',
+  'be/View/Dialog/Layover',
+  'be/View/Popup',
+  'project/trait/mature',
+  'page_constants'
+], function(xhr, Controller, Layover, Popup, mature, constants) {
+  'use strict';
+
+  var popup = Popup.extend(mature),
+  layover = Layover.extend(mature),
+
+  constructor = Controller.extend({
+    render : function() {
+      if (!this.View) { return; }
+      this.View.render(document.body);
+      this.View.position();
+    },
+
+    disableSafeBrowsing : function() {
+      return xhr({
+        type : 'DELETE',
+        url  : constants.BROWSING_URL,
+      })
+      .then(function(data) {
+        window.location.reload();
+      }, console.error);
+    }
+  }, {
+    VIEW_CLASS : {
+      phone   : layover,
+      tablet  : popup,
+      desktop : popup
+    }
+  });
+
+  return constructor;
+});
+
+
+define("require/hgn!templates/project/matureLogin", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div class=\"mature-message\">");t.b("\n" + i);t.b("  You must log in or sign up for Behance<br class=\"hide-phone\">");t.b("\n" + i);t.b("  to view projects containing adult content.");t.b("\n" + i);if(t.s(t.f("login",c,p,1),c,p,0,150,162,"{{ }}")){t.rs(c,p,function(c,p,t){t.b(t.rp("<button0",c,p,""));});c.pop();}t.b("</div>");t.b("\n");t.b("\n" + i);t.b("<div class=\"popup-buttons\">");t.b("\n" + i);t.b("  Don't Have an Account? <a class=\"signup js-adobeid-signup\">Sign up for Behance</a>");t.b("\n" + i);t.b("</div>");t.b("\n");return t.fl(); },partials: {"<button0":{name:"button", partials: {}, subs: {  }}}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('project/Controller/MatureLogin',[
+  'be/Controller/Dialog',
+  'be/View/Dialog/Layover',
+  'be/View/Popup',
+  'vendor/history',
+  'hgn!templates/project/matureLogin'
+], function(Controller, Layover, Popup, History, matureLogin) {
+  'use strict';
+
+  var mature = {
+    mustache : matureLogin,
+    hide : function() { History.back(); }
+  },
+  popup = Popup.extend(mature),
+  layover = Layover.extend(mature),
+
+  constructor = Controller.extend({
+
+    render : function() {
+      if (!this.View) { return; }
+      this.View.render(document.body);
+      this.View.position();
+    },
+
+  }, {
+    VIEW_CLASS : {
+      phone   : layover,
+      tablet  : popup,
+      desktop : popup
+    }
+  });
+
+  return constructor;
+});
+
+define('project/lib/mature',[
+  'project/Controller/MatureContent',
+  'project/Controller/MatureLogin'
+], function(MatureContent, MatureLogin) {
+  'use strict';
+
+  var api = {
+    init : function(id, config, constants) {
+      // Not mature project, no need for anything else
+      if ( !config.project.mature_content ) { return; }
+
+      var popup, message;
+
+      if ( config.project.mature_access === 'logged-out' ) {
+        popup = new MatureLogin({
+          classes: ['mature-blocker', 'log-in'],
+          login: {
+            classes: ['form-button-default', 'form-button-large', 'js-adobeid-signin'],
+            label: "Log In",
+          }
+        });
+      }
+      else {
+        message = constants.MATURE_ACCESS[ config.project.mature_access ];
+        if ( !message ) { return; }
+
+        popup = new MatureContent(id, {
+          html   : message,
+          access : config.project.mature_access
+        });
+      }
+
+      popup.render();
+      this.popup = popup;
+    },
+
+    destroy : function() {
+      if (this.popup) {
+        this.popup.destroy();
+      }
+    }
+  };
+
+  return api;
+
+});
+
+define('project/lib/embed',[
+  'jquery',
+  'nbd/util/async'
+], function($, async) {
+  'use strict';
+
+  var normalize = function() {
+    var $this = $(this).removeAttr('allowscriptaccess'),
+        $module = $this.closest('.module');
+
+    // if wmode isn't set or is set to something else, set it to transparent
+    if ($this.attr('wmode') === 'transparent') { return; }
+    // IMPORTANT: if this changes here, also change it in the project editor
+    $module.height($module.height());
+    $this.attr('wmode', 'transparent').hide();
+
+    // Reloads embed
+    async(function() { $this.show(); });
+  },
+
+  embedFix = function() {
+    return this.each(normalize);
+  };
+
+  embedFix.init = function($context) {
+    $('#primary-project-content .module embed', $context).embedFix();
+  };
+
+  return ($.fn.embedFix = embedFix);
+});
+
+define('project/lib/video',[
+  'jquery'
+], function($) {
+  'use strict';
+
+  function replaceProtocol($context) {
+    $context.each(function() {
+      var $element = $(this),
+          html     = $element.html();
+
+      $element.html(html.replace(/http(\:|%)/g, 'https$1'));
+    });
+  }
+
+  return {
+    replaceProtocol: replaceProtocol
+  };
+});
+
+define('project/content',[
+  'jquery',
+  'nbd/util/async',
+  'lib/scrollpoint',
+  'project/View/Appreciation',
+  'project/lib/highdef',
+  'project/lib/mature',
+  'project/lib/embed',
+  'project/lib/video'
+], function($, async, scrollpoint, Appreciate, highdef, mature, embedFix, video) {
+  'use strict';
+
+  return {
+    init: function($context, config, constants) {
+
+      // mature content blocking
+      mature.init(config.project.id, config, constants);
+
+      // appreciation button
+      this.appreciate = new Appreciate(config.project.id);
+      this.appreciate.render($context.find('#appreciation'));
+
+      // lazyload images
+      async(function() {
+        this.lazyload($context);
+      }.bind(this));
+
+      // Ensure embeds have proper display
+      $context.find('.module.embed embed').embedFix();
+
+      video.replaceProtocol($('.module.video'));
+
+      // High definition images
+      if ($context.is('.hd_images_enabled')) {
+        $context.find('.hd_avail').highdef();
+      }
+
+    },
+
+    lazyload: function lazyload($context) {
+
+      var loadpoint =
+        $context.find('.module.image img:not(.lazy-load):last').offset() ||
+        $context.find('.module.image img.lazy-load:first').offset(),
+      $contextParent = $context.closest('.popup');
+
+      if (!loadpoint) { return; }
+
+      scrollpoint(loadpoint.top - $context.offset().top - window.innerHeight, function() {
+        // Load every image
+        $context.find('.module.image img.lazy-load')
+        .each(function() {
+          var $this = $(this);
+          $this
+          .attr('src', $this.attr('original'))
+          .css('opacity', 0)
+          .one('load', function() {
+            $this.animate({opacity: 1}, 150);
+            $this.removeClass('lazy-load');
+          });
+        });
+      }, $contextParent.length ? '#project-popup' : 'window');
+
+    },
+
+    destroy: function() {
+      if (this.appreciate) {
+        this.appreciate.destroy();
+      }
+      mature.destroy();
+    }
+  };
+});
+
+
+define("require/hgn!templates/comment", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<li class=\"comment-container\" data-id=\"");t.b(t.v(t.f("id",c,p,0)));t.b("\">");t.b("\n" + i);t.b("  <a class=\"comment-img-link\" href=\"");t.b(t.v(t.d("user.url",c,p,0)));t.b("\">");t.b("\n" + i);t.b("    <img class=\"comment-img\" src=\"");t.b(t.v(t.d("user.images.50",c,p,0)));t.b("\">");t.b("\n" + i);t.b("  </a>");t.b("\n");t.b("\n" + i);t.b("  <div class=\"comment-content-wrap\">");t.b("\n" + i);t.b("    <div class=\"comment-user-info\">");t.b("\n" + i);t.b("      <a class=\"comment-username-link\" href=\"");t.b(t.v(t.d("user.url",c,p,0)));t.b("\">");t.b(t.v(t.d("user.display_name",c,p,0)));t.b("</a>");t.b("\n" + i);if(t.s(t.f("replied_to",c,p,1),c,p,0,341,429,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("        <span>replied to <a href=\"");t.b(t.v(t.d("user.url",c,p,0)));t.b("\">");t.b(t.v(t.d("user.display_name",c,p,0)));t.b("</a></span>");t.b("\n" + i);});c.pop();}t.b("\n" + i);t.b("      <span class=\"comment-date\">");t.b(t.v(t.f("time_ago",c,p,0)));t.b("</span>");t.b("\n" + i);t.b("    </div>");t.b("\n");t.b("\n" + i);t.b("    <div class=\"comment-text-wrap\">");t.b("\n" + i);t.b("      <div class=\"comment-text\">");t.b(t.t(t.f("comment",c,p,0)));t.b("</div>");t.b("\n" + i);t.b("    </div>");t.b("\n");t.b("\n" + i);if(t.s(t.d("permissions.close",c,p,1),c,p,0,637,715,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("      <a class=\"comment-delete beicons-x beicons js-delete\" href=\"\"></a>");t.b("\n" + i);});c.pop();}t.b("  </div>");t.b("\n" + i);t.b("</li>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('be/View/Comment',['jquery',
+       'nbd/View/Entity',
+       'nbd/util/pipe',
+       'hgn!templates/comment'
+], function($, Entity, pipe, comment) {
+  'use strict';
+
+  // TODO: Network constant needed
+  var permissions = {
+    '3000' : 'close'
+  },
+
+  constructor = Entity.extend({
+    template : pipe(comment, $),
+
+    templateData : function() {
+      var data = this._super();
+      data.permissions = data.permissions.reduce(function(o, key) {
+        o[ permissions[key] ] = true;
+        return o;
+      }, {});
+      return data;
+    },
+
+    rendered : function() {
+      this.$view
+      .hide().fadeIn()
+      .on('click', '.comment-close', function() {
+        this.$view.fadeOut(
+          this.trigger.bind(this, 'destroy')
+        );
+      }.bind(this) );
+    }
+  });
+
+  return constructor;
+});
+
+define('be/Controller/Comment',['nbd/Controller/Entity',
+       'nbd/Model',
+       'be/View/Comment',
+       'nbd/trait/pubsub'
+], function(Entity, Model, View, pubsub) {
+  'use strict';
+
+  var constructor = Entity.extend({
+
+    id : function() {
+      return this.Model && this.Model.id();
+    },
+
+    _initView : function() {
+      this._super.apply(this, arguments);
+      this.listenTo(this.View, 'all', this.trigger);
+    },
+
+    destroy : function() {
+      this.stopListening();
+      this._super();
+    }
+  }, {
+    MODEL_CLASS: Model,
+    VIEW_CLASS: View
+  })
+  .mixin( pubsub );
+
+  return constructor;
+});
+
+/*
+ * Specifically for loading more stuff
+ * when they have see-more-button-container
+ * Use the static init() method, it's a factory
+ */
+define('lib/loadmore',['jquery', 'nbd/Class', 'nbd/util/construct', 'nbd/util/extend'
+], function($, Class, construct, extend) {
+  'use strict';
+
+  var constructor = Class.extend({
+
+    loading : false,
+
+    moreSelector : '.see-more-button-container',
+
+    init : function($content, data, callback) {
+      this.data = data || {};
+      this.callback = callback;
+      this.loading = false;
+      this.$content = $content;
+
+      this.$more = $(this.moreSelector, this.data.$pagination);
+
+      this.get = this.more.bind(this, undefined);
+
+      this.$more.on('click', this.get);
+
+      this.before();
+    },
+
+    set : function(data) {
+      extend(this.data, data);
+      return this;
+    },
+
+    destroy : function() {
+      this.$more.off('click', this.get);
+    },
+
+    load : function(obj) {
+      return $.ajax({
+        data : $.extend({}, this.data, obj)
+      });
+    },
+
+    more : function(option) {
+      this.loading = true;
+      return this.load(option)
+      .then(this.render.bind(this))
+      .done(this.after.bind(this))
+      .done(this.callback);
+    },
+
+    render : function(response) {
+      this.loading = false;
+
+      return response.html ?
+        $(response.html).appendTo(this.$content) :
+        response;
+    },
+
+    before : function() {},
+
+    after : function() {}
+
+  }, {
+    init : function() {
+      return construct.apply(this, arguments);
+    }
+  });
+
+  return constructor;
+});
+
+define('be/comments',['jquery',
+       'be/Controller/Comment',
+       'lib/loadmore',
+       'nbd/trait/pubsub'
+], function($, Comment, loadmore, pubsub) {
+  'use strict';
+
+  /**
+   * Use the static initializer:
+   *
+   * @example
+   * comments.init($list, {
+   *   type : 'project',
+   *   entity_id : 1
+   * }, callback);
+   * comments.get();
+   */
+  return loadmore.extend({
+
+    _posts : [],
+
+    destroy : function() {
+      this.stopListening();
+      this.clear();
+      this._super();
+    },
+
+    load : function(obj) {
+      return $.ajax({
+        url : '/comments/' + this.data.type,
+        data : $.extend({
+          sort_order: 'desc'
+        }, this.data, obj)
+      });
+    },
+
+    render : function(response) {
+      var comments;
+
+      if (response && response.comments) {
+        comments = response.comments.map(this._makePost, this);
+        this._posts = this._posts.concat(comments);
+      }
+
+      this._posts[this.data.order === 'asc' ?
+        'reduceRight' :
+        'reduce'
+      ] (function(context, post) {
+        post.render(context.$content);
+        return context;
+      }, this);
+
+      return response;
+    },
+
+    after : function() {
+      // Get last post id
+      this.data.offset = this._posts.length ?
+        this._posts[ this._posts.length-1 ].id() :
+        undefined;
+    },
+
+    _makePost : function(comment) {
+      var post = new Comment(comment.id, comment);
+      this.listenTo(post, 'destroy', this.remove.bind(this, post));
+      return post;
+    },
+
+    add : function(comment) {
+      var post = comment instanceof Comment ?
+        comment :
+        this._makePost(comment);
+
+      this._posts.unshift(post);
+      this.render();
+    },
+
+    remove : function(post) {
+      var i;
+      if (~(i=this._posts.indexOf(post))) {
+        // DELETE doesn't support data: obj
+        $.ajax({
+          type: 'delete',
+          url : '/comments/' + this.data.type + '?comment_id=' + post.id()
+        });
+        this._posts.splice(i, 1);
+        post.destroy();
+      }
+    },
+
+    clear : function() {
+      this._posts.forEach(function(post) {
+        post.destroy();
+      });
+      this._posts = [];
+      return this;
+    }
+
+  })
+  .mixin(pubsub);
+});
+
+define('ccn/View/Comment',[
+  'moment',
+  'be/View/Comment',
+  'nbd/util/extend'
+], function(moment, Comment, extend) {
+  'use strict';
+
+  return Comment.extend({
+    templateData: function() {
+      var data = this._model.data();
+
+      return extend({
+        time_ago: moment.unix(data.created_on).fromNow()
+      }, data);
+    },
+    rendered: function() {
+      this.$view
+      .hide()
+      .fadeIn()
+      .on('click', '.js-delete', function(e) {
+        e.preventDefault();
+        this.$view.fadeOut(
+          this.trigger.bind(this, 'destroy')
+        );
+      }.bind(this));
+    }
+  });
+});
+
+define('ccn/Controller/Comment',[
+  'be/Controller/Comment',
+  'ccn/View/Comment'
+], function(Comment, View) {
+  'use strict';
+
+  return Comment.extend({}, {
+    VIEW_CLASS: View
+  });
+});
+
+define('ccn/comments',[
+  'jquery',
+  'lib/xhr',
+  'be/comments',
+  'ccn/Controller/Comment'
+], function($, xhr, comments, Comment) {
+  'use strict';
+
+  return comments.extend({
+    url: '/comments',
+    hasMore: true,
+    load: function(obj) {
+      return xhr({
+        url: this.url,
+        data: $.extend({}, this.data, obj)
+      });
+    },
+    more: function(option) {
+      if (!this.hasMore) { return; }
+
+      var promise = this.load(option).then(this.render.bind(this));
+
+      promise.then(this.after.bind(this));
+      promise.then(this.callback);
+      return promise;
+    },
+    after: function(response) {
+      if (!response.more) { this.hasMore = false; }
+
+      // Increment page view for next set of comments
+      this.data.page++;
+    },
+    _makePost: function(comment) {
+      var post = new Comment(comment.id, comment);
+
+      this.listenTo(post, 'destroy', this.remove.bind(this, post));
+      return post;
+    },
+    add: function(comment) {
+      var post = comment instanceof Comment ? comment : this._makePost(comment);
+
+      this._posts.unshift(post);
+      this.render();
+    },
+    remove: function(post) {
+      var index = this._posts.indexOf(post);
+
+      if (!!~index) {
+        // DELETE doesn't support data: obj
+        return xhr({
+          type: 'delete',
+          url: '/comments?comment_id=' + post.id() + '&entity_id=' + this.data.entity_id
+        })
+        .then(this._posts.splice(index, 1))
+        .then(post.destroy());
+      }
+    }
+  });
+});
+
+/********************************************************
+ * SWFUpload jQuery Plugin v1.0
+ *
+ * This plugin will count the characters contained in the 
+ * binded element and can prevent any further character entry.
+ * 
+ * INSTRUCTIONS: 
+ * In your javascript, add ".simpleCounter()" to any input field or
+ * textarea you wish to count and/or limit. 
+ * 
+ * DISPLAY:
+ * To display the counter, insert the following into your HTML:
+ *
+ *      <div class="counter-container cfix">
+ *        <span id="[field name]-counter" class="right"></span>
+ *      </div>
+ *
+ * The container is not required, but is useful to position and 
+ * style the counter html. See network.css for class definitions
+ *
+ * PARAMETERS: See comments below for parameter explainations.
+ *
+ ********************************************************/
+
+
+
+(function ($) {
+
+  $.fn.simpleCounter = function( userParams ) {
+
+    this.each( function() {
+    
+      var $field            = $(this),
+          $counter          = false,
+          field_classes     = $field.attr( 'class' ).split(' '),
+
+      
+          params = {
+            max:              255,                  // Set as "isMinimum[0]|isMaximum[#]" rule in CRV setRule. Can be overriden in JS (though CRV will still enforce its own maximum server-side)
+            warn:             10,                   // The amount of characters remaining int he field before the text changes to the "warn" color, informing the user the max limit is close
+            strict:           true,                 // Prevents user from typing any data past the limit. Pasting more characters than the max will still work, though CRV will prevent form submission
+            truncate:         true,                 // When pasting more characters than the max, this setting will truncate the field down to the max limit. Works only when "strict" is true
+            direction:        'down',               // Direction of counter (down = counts down from max to 0. up = counts up to the max).
+            downAppendString: 'characters left',    // Text that follows the character count when counting down
+            upAppendString:   'characters',         // Text that follows the character count when counting up
+            normalStyle:      'counter-normal',     // Class name of normal color for the coutner and its text
+            warnStyle:        'counter-warn',       // Class name of the warn color for the coutner and its text
+            maxStyle:         'counter-max'         // Class name of the max color for the coutner and its text
+          },
+          
+          allowedAtMax = [
+          
+            $.ui.keyCode.BACKSPACE,
+            $.ui.keyCode.DELETE,
+            $.ui.keyCode.CONTROL,
+            $.ui.keyCode.SHIFT,
+            $.ui.keyCode.UP,
+            $.ui.keyCode.DOWN,
+            $.ui.keyCode.LEFT,
+            $.ui.keyCode.RIGHT,
+            $.ui.keyCode.HOME,
+            $.ui.keyCode.END,
+            $.ui.keyCode.PAGE_UP,
+            $.ui.keyCode.PAGE_DOWN,
+            $.ui.keyCode.PAGE_DOWN
+          ],
+       
+          updateCounter = function(){ 
+            var count   = $field.val().length;
+            if ( params.direction == 'down' ){
+              $counter.text( (params.max - count) + ' ' + params.downAppendString );
+            }
+            else {
+              $counter.text( count + ' ' + params.upAppendString);
+            } 
+            
+            updateColor( count );
+            
+          }, // update the counter text
+          
+          updateCounter2 = function(){
+
+            var count   = $field.val().length;
+            if ( params.direction == 'down' ){
+              $counter.text( (params.max - count) + ' ' + params.downAppendString );
+            }
+            else {
+              $counter.text( count + ' ' + params.upAppendString);
+            } 
+            
+            updateColor( count );
+            
+          }, // update the counter text
+          
+          updateColor = function( count ){ 
+            
+            if ( count >= params.max ){
+              $counter.addClass( params.maxStyle ).removeClass(params.warnStyle).removeClass(params.normalStyle);
+              $field.trigger('simplecounter-max');
+            } // if max or greater
+            
+            else {
+               
+              if ( count >= ( params.max - params.warn ) ){
+                $counter.addClass( params.warnStyle ).removeClass(params.normalStyle).removeClass(params.maxStyle);
+                $field.trigger('simplecounter-warn');
+              } // if in warn range
+              
+              else{
+                $counter.addClass( params.normalStyle ).removeClass(params.warnStyle).removeClass(params.maxStyle);
+                $field.trigger('simplecounter-normal');
+              } // if normal 
+            } // if not max 
+          },
+          
+          truncateField = function () {
+            $field.val( $field.val().substring(0, params.max) ); 
+          },
+
+          countNow = function( e ){ 
+            var count   = $field.val().length;
+            
+            if ( count >= params.max ){
+
+              if ( params.strict && params.truncate && e !== true &&  $.inArray( e.keyCode, allowedAtMax ) == -1) {
+                truncateField();
+              } // prevent pasting and additional characters if strict and truncate 
+              
+            } // if max or greater
+            
+            updateCounter();
+        
+          }, // countNow
+          
+          checkStop = function( e ) {
+          
+            if ( ( $.inArray( e.keyCode, allowedAtMax ) == -1 ) && params.strict && $field.val().length >= params.max ) {
+              
+              if ( params.truncate ) { 
+                truncateField();
+                updateCounter();
+              }
+              
+              return false; 
+              
+            }
+          }; // checkStop on keydown
+          
+      
+      $.each( field_classes, function(index, value) {
+        if ( value.match( /validate\[(?:[^,]*|.*,)length\[([0-9]+),([0-9]+)\].*\]/i ) ) {
+          params.max = value.replace(/validate\[(?:[^,]*|.*,)length\[([0-9]+),([0-9]+)\].*\]/i,'$2');
+          return;
+        }
+      });
+      
+      params   = $.extend({}, params, userParams);
+      $counter = ( params.$counter ) ? params.$counter : $( '#' + $field.attr('id') + '-counter' );
+      
+      if ( !$counter.length ) {
+        return;
+      }
+      
+      if ( params.direction == 'down' ){
+        $counter.text( (params.max) + params.downAppendString );
+      }
+      else {
+        $counter.text( '0' + params.upAppendString);
+      }
+      
+      countNow(true);
+      
+      $field.bind('keyup', countNow);    
+      $field.bind('keydown', checkStop);   
+      $field.bind('alter', updateCounter2 );    
+        
+    }); // each
+    
+    return this;
+    
+  }; // fn.simpleCounter
+
+}(jQuery));
+
+define("jquery/plugins/jquery.simpleCounter", function(){});
+
+define('project/lib/comments',[
+  'jquery',
+  'ccn/comments',
+  'be/trait/form',
+  'nbd/util/media',
+  'nbd/util/async',
+  'jquery/plugins/jquery.simpleCounter'
+], function($, comments, form, media, async) {
+  'use strict';
+
+  return {
+    more: true,
+    $context: '',
+
+    init: function($context, config) {
+      this.$context = $context;
+      this.$view = $context.find('#post-comment-block');
+
+      var id = config.project.id,
+          $comment = $context.find('#comment'),
+          view;
+
+      async(function() {
+        $comment.simpleCounter();
+      });
+
+      view = this.view(id, $context);
+      this.create(id, view);
+
+      // Make this fire AFTER responsive is initialized
+      async(function() {
+        if (config.open_comments && media.is('desktop')) {
+          $(window).scrollTop($('#project-comments').offset().top);
+        }
+      }.bind(this));
+    },
+    destroy: function() {
+      if (this.$view) { this.$view.remove(); }
+    },
+    view: function(id, $context) {
+      var $pagination = $context.find('#comments-pagination'),
+
+        view = comments.init($context.find('#comments-list'), {
+          entity_id: id,
+          page: 1
+        }, function() {
+          if (view.hasMore) {
+            $pagination.removeClass('hide');
+          }
+          else {
+            $pagination.addClass('hide');
+          }
+        });
+
+      // load first page
+      view.get();
+
+      return view;
+    },
+    create: function(id, view) {
+      var comment;
+
+      function prepend(data) {
+        if (!(data.id && data.user)) { throw data; }
+
+        view.add({
+          id: data.id,
+          user: data.user,
+          comment: comment,
+          posted_on: 'Just now',
+          permissions: {
+            close: 'true'
+          }
+        });
+      }
+
+      form.onSubmit.call(this, function(data) {
+        data.entity_id = id;
+        comment = data.comment;
+
+        this.then(prepend);
+
+        return this;
+      });
+    }
+  };
+});
+
+
+define("require/hgn!templates/project/info", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div class=\"project-info\">");t.b("\n" + i);t.b("  <div class=\"menu-group\">");t.b("\n" + i);t.b("    <h2 class=\"menu-title\">");t.b("\n" + i);t.b("      Project Info");t.b("\n" + i);t.b("    </h2>");t.b("\n" + i);t.b("    <div class=\"menu-section\">");t.b("\n" + i);t.b("      <span class=\"menu-label\">Created:</span> ");t.b(t.v(t.f("created_on",c,p,0)));t.b("\n" + i);t.b("    </div>");t.b("\n" + i);t.b("    <div class=\"menu-section\">");t.b("\n" + i);t.b("      <span class=\"menu-label\">Last Edited:</span> ");t.b(t.v(t.f("modified_on",c,p,0)));t.b("\n" + i);t.b("    </div>");t.b("\n" + i);t.b("    <div class=\"menu-section\">");t.b("\n" + i);t.b("      <span class=\"menu-label\">About:</span> ");t.b(t.v(t.f("description",c,p,0)));t.b("\n" + i);t.b("    </div>");t.b("\n");t.b("\n" + i);t.b("    <div class=\"menu-section\">");t.b("\n" + i);t.b("      <span class=\"menu-label\">Tools:</span>");t.b("\n" + i);if(t.s(t.f("tools",c,p,1),c,p,0,520,565,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("      <a href=\"");t.b(t.v(t.f("url",c,p,0)));t.b("\">");t.b(t.v(t.f("title",c,p,0)));t.b("</a>");t.b("\n" + i);});c.pop();}t.b("    </div>");t.b("\n");t.b("\n" + i);t.b("    <div class=\"menu-section\">");t.b("\n" + i);t.b("      <span class=\"menu-label\">Tags:</span>");t.b("\n" + i);if(t.s(t.f("tags",c,p,1),c,p,0,678,723,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("      <a href=\"");t.b(t.v(t.f("url",c,p,0)));t.b("\">");t.b(t.v(t.f("title",c,p,0)));t.b("</a>");t.b("\n" + i);});c.pop();}t.b("    </div>");t.b("\n" + i);t.b("  </div>");t.b("\n");t.b("\n" + i);t.b("  <div class=\"menu-group\">");t.b("\n" + i);t.b("    <h2 class=\"menu-title\">");t.b("\n" + i);t.b("      Copyright Info");t.b("\n" + i);t.b("    </h2>");t.b("\n" + i);t.b("    <div class=\"menu-section\">");t.b("\n" + i);if(t.s(t.f("copyright",c,p,1),c,p,0,891,922,"{{ }}")){t.rs(c,p,function(c,p,t){t.b("      ");t.b(t.t(t.f("description",c,p,0)));t.b("\n" + i);});c.pop();}t.b("    </div>");t.b("\n" + i);t.b("  </div>");t.b("\n");t.b("\n" + i);t.b("  <div class=\"menu-section\">");t.b("\n" + i);t.b("    <a class=\"report\">Report</a>");t.b("\n" + i);t.b("  </div>");t.b("\n");t.b("\n" + i);t.b("</div> <!-- /project-info -->");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('project/trait/info',['moment',
+       'nbd/util/extend',
+       'hgn!templates/project/info'
+], function(moment, extend, info) {
+  'use strict';
+
+  return {
+    mustache : info,
+
+    templateData : function () {
+      var data = extend({
+        title: "Project Info",
+        classes: ['project-info']
+      }, this._model.data()),
+      licenses = this._model.get('constants').LICENSE_TEXTS;
+
+      // Format dates
+      ['created_on', 'modified_on'].forEach(function(key) {
+        data[key] = moment.unix(data[key]).format('M/D/YY');
+      });
+
+      data.copyright.description = licenses[ data.copyright.license ];
+
+      return data;
+    },
+
+    rendered : function() {
+      this._super();
+      this.$view.on('click', '.report', function() {
+        this.hide();
+        this.Controller.report();
+      }.bind(this));
+    }
+  };
+
+});
+
+define('project/Controller/Info',[
+  'be/Controller/Dialog/Roulette',
+  'be/View/Dialog/Layover',
+  'be/View/Menu',
+  'project/trait/info',
+  'nbd/event'
+], function (Controller, Layover, Menu, info, event) {
+  'use strict';
+
+  var constructor = Controller.extend({
+
+    report : function() {
+      // caught in project/lib/info
+      event.trigger('report:open', this.$source);
+    },
+
+    render : function($context) {
+      this.$source = $context;
+      this._super($context);
+    }
+  }, {
+    VIEW_CLASS : {
+      phone   : Layover.extend(info),
+      tablet  : Menu.extend(info)
+    }
+  });
+
+  return constructor;
+});
+
+define('project/footer',[
+  'jquery',
+  'nbd/util/async',
+  'project/lib/comments',
+  'project/Controller/Info'
+], function($, async, comments, Info) {
+  'use strict';
+
+  return {
+    init : function($context, config, constants) {
+      var infoData = $.extend({}, config, {
+        constants : constants
+      });
+
+      // view info dialog
+      this.info = new Info(config.project.id, infoData);
+      this.info.setContext( $context.find('.js-info') );
+
+      // Init the comments async so that it binds to the correct context
+      // for Project Popups.
+      async(function () {
+        comments.init($context, config);
+      });
+    },
+
+    destroy : function() {
+      if (this.info) {
+        this.info.destroy();
+      }
+    }
+  };
+});
+
+define('be/View/Dialog/Popup',[
+  'nbd/util/extend',
+  'be/View/Dialog',
+  'lib/keyboard'
+], function(extend, View, keyboard) {
+  'use strict';
+
+  var constructor = View.extend({
+    template : function(data) {
+      return this._super(extend({
+        dialogType : "desktop",
+        blocking   : true,
+        toolbar    : true
+      }, data));
+    },
+
+    render : function() {
+      constructor.Z_INDEX += 2;
+      this._zIndex = constructor.Z_INDEX;
+      return this._super.apply(this, arguments);
+    },
+
+    rendered : function() {
+      this._super();
+      this.$view.filter('.blocking-div')
+      .on('click', this.hide.bind(this));
+    },
+
+    position : function() {
+      if (!this.$view) { return; }
+
+      var $dialog = this.$view.filter('.popup');
+
+      var windowHeight = window.innerHeight ||
+        // IE compatibility
+        document.documentElement.offsetHeight,
+      offsetTop = (windowHeight - $dialog.outerHeight())/2;
+
+      // Manually center
+      $dialog.css({
+        "z-index" : this._zIndex,
+        "margin-left" : -~~($dialog.width()/2) + 'px',
+        "top" : Math.max(0, offsetTop)
+      })
+      // Then show in position
+      .addClass('shown');
+
+      this.$view.filter('.blocking-div')
+      .css("z-index", this._zIndex-1);
+    },
+
+    show : function() {
+      if (!this.$view) { return; }
+      keyboard.on({'escape': this.hide.bind(this)});
+      if (!this.$view.parent().is(document.body)) {
+        this.$view.appendTo(document.body);
+      }
+      return this._super();
+    },
+
+    hide : function() {
+      if (!this.$view) { return; }
+      keyboard.off();
+      this.$view.detach();
+      return this._super();
+    },
+
+    toggle : function() {
+      var state = this.$view.parent().is(document.body);
+      return this[ state ? 'hide' : 'show' ]();
+    }
+  }, {
+    Z_INDEX: 250
+  });
+
+  return constructor;
+});
+
+define('be/Modal',[
+  'nbd/trait/promise',
+  'nbd/util/extend',
+  'be/Controller/Dialog',
+  'be/View/Dialog/Layover',
+  'be/View/Dialog/Popup',
+  'hgn!templates/html'
+], function(Promise, extend, Dialog, Layover, Popup, html) {
+  'use strict';
+
+  var base = {
+    mustache: html,
+
+    templateData: function() {
+      return extend({
+        buttons: [{
+          label: "Okay",
+          classes: ['form-button-default', 'js-confirm']
+        }, {
+          label: "Cancel",
+          classes: ['form-button-cancel', 'js-cancel']
+        }]
+      }, this._model.data());
+    },
+
+    rendered: function() {
+      this._super();
+      this.$view
+      .on('click', '.js-confirm', this.trigger.bind(this, 'confirm'))
+      .on('click', '.js-cancel', this.trigger.bind(this, 'cancel'));
+    }
+  },
+
+  BaseLayover = Layover.extend(base),
+  BasePopup = Popup.extend(base),
+
+  BaseDialog = Dialog.extend({
+    init: function() {
+      this._super.apply(this, arguments);
+      this._view
+      .on('confirm', function() {
+        this.confirm.apply(this, arguments);
+      }, this)
+      .on('hide', function() {
+        this.cancel.apply(this, arguments);
+      }, this);
+    },
+    confirm: function() {
+      this.resolve();
+    },
+    cancel: function() {
+      this.reject();
+    },
+    render: function() {
+      this._super(document.body);
+      this._view.position();
+    }
+  }, {
+    VIEW_CLASS: {
+      phone: BaseLayover,
+      tablet: BasePopup,
+      desktop: BasePopup
+    }
+  })
+  .mixin(Promise);
+
+  return BaseDialog;
+});
+
+define('be/modal/simple',['be/Modal'], function(Dialog) {
+  'use strict';
+
+  return function popup(options, promiseGenerator) {
+    var dialog = new Dialog(options),
+        destroy = dialog.destroy.bind(dialog);
+
+    if (typeof promiseGenerator === 'function') {
+      dialog.confirm = function confirm() {
+        if (confirm.blocking) { return; }
+
+        confirm.blocking = true;
+        function unblock() {
+          confirm.blocking = false;
+        }
+
+        var retval = promiseGenerator();
+        if (retval && typeof retval.then === 'function') {
+          retval
+          .then(dialog.resolve.bind(dialog))
+          .then(unblock, unblock);
+        }
+        else {
+          dialog.resolve(retval);
+          unblock();
+        }
+      };
+    }
+
+    dialog.render();
+    dialog.then(destroy, destroy);
+    return dialog;
+  };
+});
+
+
+define("require/hgn!templates/gallery/unverified", ["hogan"], function(hogan){  var tmpl = new hogan.Template({code: function (c,p,i) { var t=this;t.b(i=i||"");t.b("<div class=\"unverified-modal-content\">");t.b("\n" + i);t.b("  <div class=\"unverified-message\">");t.b("\n" + i);t.b("    Your project is currently not visible publicly because your account");t.b("\n" + i);t.b("    is unverified.");t.b("\n" + i);t.b("  </div>");t.b("\n");t.b("\n" + i);t.b("  <div class=\"verify-warning notice-box\">");t.b("\n" + i);t.b("    <p class=\"verify-warning-body\">");t.b("\n" + i);t.b("      Please check your inbox and verify your email address.");t.b("\n" + i);t.b("      Haven't received a verification email yet?");t.b("\n" + i);t.b("      <br />");t.b("\n" + i);t.b("      <a href=\"");t.b(t.v(t.f("verification_url",c,p,0)));t.b("\">Click here</a>.");t.b("\n" + i);t.b("    </p>");t.b("\n" + i);t.b("  </div>");t.b("\n" + i);t.b("</div>");t.b("\n");return t.fl(); },partials: {}, subs: {  }}, "", hogan);  function render(){ return tmpl.render.apply(tmpl, arguments); } render.template = tmpl; return render;});
+
+define('project/lib/startup',[
+  'log',
+  'be/modal/simple',
+  'hgn!templates/gallery/unverified'
+], function(log, simple, template) {
+  'use strict';
+
+  log = log.get('project/lib/startup');
+
+  return {
+    init: function(config) {
+      if (config.unverified) {
+        simple({
+          title: 'Your project is private',
+          classes: ['unverified-modal'],
+          html: template({
+            verification_url: config.verification_url,
+            email: config.email
+          })
+        });
+      }
+    }
+  };
+});
+
+require([
+  'jquery',
+  'nbd/util/media',
+  'responsive',
+  'be/follow',
+  'lib/social',
+  'project/sidebar',
+  'project/content',
+  'project/footer',
+  'project/lib/startup',
+  'vendor/history',
+  'page_config',
+  'page_constants',
+  'hgn!templates/project/viralIcons'
+], function($, media, responsive, follow, social, sidebar, content, footer, startup, History, config, constants, viralIcons) {
+  'use strict';
+
+  var $body = $(document.body),
+  originalUrl = window.location.href,
+  $shareContainer = $body.find('#share-container');
+
+  responsive.init();
+  follow.init();
+
+  sidebar.init($body, config, constants);
+  content.init($body.find('.js-primary-project-content'), config, constants);
+  footer.init($body.find('#project-footer'), config, constants);
+  startup.init(config);
+
+  // share buttons
+  $shareContainer.html(viralIcons({
+    url: document.location.href,
+    title: document.title,
+    no_pinterest: config.project.copyright.license === "no-use"
+  }));
+  social.init($shareContainer);
+
+  $(window).on('popstate', function(e) {
+    if (!e.originalEvent) { return; }
+    var state = History.getState();
+
+    if (originalUrl !== state.url) {
+      window.location.replace(state.url);
+    }
+  })
+  // Extra scroll event to kick off the scrollpoints
+  .trigger('scroll');
+});
+
+define("gallery", function(){});
+
